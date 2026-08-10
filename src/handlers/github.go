@@ -102,7 +102,7 @@ var lookupDirectLinkIPs = net.DefaultResolver.LookupNetIP
 var (
 	errDirectLinkSpoolCapacity = errors.New("direct-link spool capacity exhausted")
 	directLinkStagingQuota     = &directLinkSpoolQuota{}
-	directLinkStagingSlots     = make(chan struct{}, 16)
+	directLinkRequestSlots     = make(chan struct{}, 16)
 	directLinkBodyIdleTimeout  = 2 * time.Minute
 	directLinkRequestTimeout   = 30 * time.Minute
 )
@@ -366,6 +366,18 @@ func ProxyGitHubRequest(c *gin.Context, u string) {
 		requestContext, cancelRequest := context.WithTimeout(c.Request.Context(), directLinkRequestTimeout)
 		defer cancelRequest()
 		c.Request = c.Request.WithContext(requestContext)
+
+		requestSlots := directLinkRequestSlots
+		select {
+		case requestSlots <- struct{}{}:
+			defer func() { <-requestSlots }()
+		case <-requestContext.Done():
+			finishDirectLinkContextError(c)
+			return
+		default:
+			c.String(http.StatusServiceUnavailable, "直链请求并发已满，请稍后重试")
+			return
+		}
 	}
 	requestState := proxyRequestState{
 		method: c.Request.Method,
@@ -390,13 +402,14 @@ func proxyGitHubWithRedirect(
 		return
 	}
 	var directTargetAddresses []netip.Addr
+	var directTargetServerName string
 	if directLink {
 		targetURL, err := url.Parse(u)
 		if err != nil {
 			c.String(http.StatusForbidden, "无效的通用直链地址")
 			return
 		}
-		directTargetAddresses, err = validateDirectLinkTarget(c.Request.Context(), targetURL)
+		directTargetAddresses, directTargetServerName, err = validateDirectLinkTarget(c.Request.Context(), targetURL)
 		if err != nil {
 			if finishDirectLinkContextError(c) {
 				return
@@ -461,7 +474,7 @@ func proxyGitHubWithRedirect(
 			} else {
 				transport.TLSClientConfig = transport.TLSClientConfig.Clone()
 			}
-			transport.TLSClientConfig.ServerName = req.URL.Hostname()
+			transport.TLSClientConfig.ServerName = directTargetServerName
 			originalHost := req.URL.Host
 			port := req.URL.Port()
 			if port == "" {
@@ -615,16 +628,6 @@ func proxyGitHubWithRedirect(
 
 	responseBody := io.Reader(resp.Body)
 	if directLink && c.Request.Method == http.MethodGet {
-		select {
-		case directLinkStagingSlots <- struct{}{}:
-			defer func() { <-directLinkStagingSlots }()
-		case <-c.Request.Context().Done():
-			finishDirectLinkContextError(c)
-			return
-		default:
-			c.String(http.StatusServiceUnavailable, "直链暂存并发已满，请稍后重试")
-			return
-		}
 		staged, err := os.CreateTemp("", "hubproxy-direct-*")
 		if err != nil {
 			c.String(http.StatusInternalServerError, "无法暂存直链响应")
@@ -881,24 +884,26 @@ func contentRangeTotal(value string) (int64, bool) {
 	return total, true
 }
 
-func validateDirectLinkTarget(ctx context.Context, targetURL *url.URL) ([]netip.Addr, error) {
+func validateDirectLinkTarget(ctx context.Context, targetURL *url.URL) ([]netip.Addr, string, error) {
 	if targetURL == nil || !strings.EqualFold(targetURL.Scheme, "https") || targetURL.Hostname() == "" || targetURL.User != nil {
-		return nil, fmt.Errorf("通用直链目标必须是无来源凭据的 HTTPS 地址")
+		return nil, "", fmt.Errorf("通用直链目标必须是无来源凭据的 HTTPS 地址")
 	}
 
 	hostname := strings.TrimSuffix(targetURL.Hostname(), ".")
 	addresses := make([]netip.Addr, 0, 1)
 	if address, err := netip.ParseAddr(hostname); err == nil {
+		address = address.Unmap()
+		hostname = address.String()
 		addresses = append(addresses, address)
 	} else {
 		asciiHostname, err := idna.Lookup.ToASCII(hostname)
 		if err != nil {
-			return nil, fmt.Errorf("无效的通用直链主机名")
+			return nil, "", fmt.Errorf("无效的通用直链主机名")
 		}
 		hostname = strings.ToLower(asciiHostname)
 		resolved, resolveErr := lookupDirectLinkIPs(ctx, "ip", hostname)
 		if resolveErr != nil || len(resolved) == 0 {
-			return nil, fmt.Errorf("无法解析通用直链目标地址")
+			return nil, "", fmt.Errorf("无法解析通用直链目标地址")
 		}
 		addresses = append(addresses, resolved...)
 	}
@@ -907,14 +912,14 @@ func validateDirectLinkTarget(ctx context.Context, targetURL *url.URL) ([]netip.
 	for _, address := range addresses {
 		address = address.Unmap()
 		if !address.IsGlobalUnicast() || address.IsPrivate() {
-			return nil, fmt.Errorf("通用直链目标地址不可访问")
+			return nil, "", fmt.Errorf("通用直链目标地址不可访问")
 		}
 		for _, blocked := range blockedDirectLinkNetworks {
 			if blocked.Contains(address) {
-				return nil, fmt.Errorf("通用直链目标地址不可访问")
+				return nil, "", fmt.Errorf("通用直链目标地址不可访问")
 			}
 		}
 		validated = append(validated, address)
 	}
-	return validated, nil
+	return validated, hostname, nil
 }

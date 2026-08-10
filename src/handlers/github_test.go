@@ -950,6 +950,54 @@ func TestDirectLinkProxySelectionUsesOriginalHostBeforeIPPinning(t *testing.T) {
 	}
 }
 
+func TestDirectLinkIDNUsesASCIIForTLSVerification(t *testing.T) {
+	serverName := make(chan string, 1)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverName <- r.TLS.ServerName
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("file"))
+	}))
+	defer upstream.Close()
+
+	previousLookup := lookupDirectLinkIPs
+	lookupDirectLinkIPs = func(_ context.Context, _, host string) ([]netip.Addr, error) {
+		if host != "xn--bcher-kva.example.com" {
+			t.Fatalf("lookup host = %q, want IDNA ASCII hostname", host)
+		}
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	}
+	t.Cleanup(func() { lookupDirectLinkIPs = previousLookup })
+
+	_ = newGitHubProxyTestRouter(t, "")
+	transport := upstream.Client().Transport.(*http.Transport).Clone()
+	upstreamAddress := upstream.Listener.Addr().String()
+	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, upstreamAddress)
+	}
+	utils.GetGlobalHTTPClient().Transport = transport
+
+	parsedUpstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := "https://" + net.JoinHostPort("bücher.example.com", parsedUpstreamURL.Port()) + "/files/app.zip"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	ProxyGitHubRequest(c, target)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "file" {
+		t.Fatalf("response = %d %q, want 200 file", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case got := <-serverName:
+		if got != "xn--bcher-kva.example.com" {
+			t.Fatalf("TLS server name = %q, want xn--bcher-kva.example.com", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream TLS handshake was not observed")
+	}
+}
+
 func TestDirectLinkStagingAllowsConcurrentSmallDownloads(t *testing.T) {
 	quota := &directLinkSpoolQuota{}
 	previousQuota := directLinkStagingQuota
@@ -1139,14 +1187,105 @@ func TestDirectLinkStagingCancelsIdleUpstream(t *testing.T) {
 	}
 }
 
-func TestDirectLinkStagingHasBoundedConcurrency(t *testing.T) {
+func TestDirectLinkRequestsHaveBoundedConcurrencyBeforeResponseHeaders(t *testing.T) {
 	previousQuota := directLinkStagingQuota
-	previousSlots := directLinkStagingSlots
+	previousSlots := directLinkRequestSlots
 	directLinkStagingQuota = &directLinkSpoolQuota{}
-	directLinkStagingSlots = make(chan struct{}, 2)
+	directLinkRequestSlots = make(chan struct{}, 1)
 	t.Cleanup(func() {
 		directLinkStagingQuota = previousQuota
-		directLinkStagingSlots = previousSlots
+		directLinkRequestSlots = previousSlots
+	})
+
+	firstStarted := make(chan struct{})
+	secondReachedUpstream := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{}, 1)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if r.URL.Path == "/first.bin" {
+			close(firstStarted)
+			<-releaseFirst
+			_, _ = w.Write([]byte("first"))
+			return
+		}
+		secondReachedUpstream <- struct{}{}
+		_, _ = w.Write([]byte("second"))
+	}))
+	defer upstream.Close()
+	defer func() {
+		select {
+		case releaseFirst <- struct{}{}:
+		default:
+		}
+	}()
+
+	router := newGitHubProxyTestRouter(t, "[server]\nfileSize = 1024\n")
+	upstreamURL := configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
+	firstResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstResult <- performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/first.bin", nil)
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first direct-link request did not reach the upstream")
+	}
+
+	secondResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		secondResult <- performGitHubProxyRequest(router, http.MethodHead, upstreamURL+"/second.bin", nil)
+	}()
+	var second *httptest.ResponseRecorder
+	secondDidNotFailFast := false
+	select {
+	case second = <-secondResult:
+	case <-time.After(2 * time.Second):
+		secondDidNotFailFast = true
+		releaseFirst <- struct{}{}
+		select {
+		case second = <-secondResult:
+		case <-time.After(2 * time.Second):
+			t.Fatal("second direct-link request remained blocked after the first was released")
+		}
+	}
+	secondReached := false
+	select {
+	case <-secondReachedUpstream:
+		secondReached = true
+	default:
+	}
+	if !secondDidNotFailFast {
+		releaseFirst <- struct{}{}
+	}
+	var first *httptest.ResponseRecorder
+	select {
+	case first = <-firstResult:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first direct-link request did not finish after release")
+	}
+
+	if secondDidNotFailFast {
+		t.Fatal("second direct-link request did not fail fast while the request slot was full")
+	}
+	if second.Code != http.StatusServiceUnavailable {
+		t.Fatalf("second HEAD response = %d %q, want 503 while first request awaits headers", second.Code, second.Body.String())
+	}
+	if secondReached {
+		t.Fatal("second request reached the upstream while the direct-link request slot was full")
+	}
+	if first.Code != http.StatusOK || first.Body.String() != "first" {
+		t.Fatalf("first response = %d %q, want 200 first", first.Code, first.Body.String())
+	}
+}
+
+func TestDirectLinkRequestsHaveBoundedConcurrencyDuringStaging(t *testing.T) {
+	previousQuota := directLinkStagingQuota
+	previousSlots := directLinkRequestSlots
+	directLinkStagingQuota = &directLinkSpoolQuota{}
+	directLinkRequestSlots = make(chan struct{}, 2)
+	t.Cleanup(func() {
+		directLinkStagingQuota = previousQuota
+		directLinkRequestSlots = previousSlots
 	})
 
 	started := make(chan struct{}, 2)
@@ -1159,7 +1298,6 @@ func TestDirectLinkStagingHasBoundedConcurrency(t *testing.T) {
 			}
 		}
 	}
-	defer releaseAll()
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		if strings.HasPrefix(r.URL.Path, "/slow-") {
@@ -1174,6 +1312,7 @@ func TestDirectLinkStagingHasBoundedConcurrency(t *testing.T) {
 		_, _ = w.Write([]byte("fast"))
 	}))
 	defer upstream.Close()
+	defer releaseAll()
 
 	router := newGitHubProxyTestRouter(t, "[server]\nfileSize = 1024\n")
 	upstreamURL := configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
@@ -1192,9 +1331,9 @@ func TestDirectLinkStagingHasBoundedConcurrency(t *testing.T) {
 		}
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for len(directLinkStagingSlots) != cap(directLinkStagingSlots) {
+	for len(directLinkRequestSlots) != cap(directLinkRequestSlots) {
 		if time.Now().After(deadline) {
-			t.Fatalf("staging slots not filled: %d/%d", len(directLinkStagingSlots), cap(directLinkStagingSlots))
+			t.Fatalf("request slots not filled: %d/%d", len(directLinkRequestSlots), cap(directLinkRequestSlots))
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -1223,18 +1362,18 @@ func TestDirectLinkStagingHasBoundedConcurrency(t *testing.T) {
 
 func TestDirectLinkRequestDeadlineStopsTrickleUpstream(t *testing.T) {
 	previousQuota := directLinkStagingQuota
-	previousSlots := directLinkStagingSlots
+	previousSlots := directLinkRequestSlots
 	previousIdleTimeout := directLinkBodyIdleTimeout
 	previousRequestTimeout := directLinkRequestTimeout
 	quota := &directLinkSpoolQuota{}
 	slots := make(chan struct{}, 2)
 	directLinkStagingQuota = quota
-	directLinkStagingSlots = slots
+	directLinkRequestSlots = slots
 	directLinkBodyIdleTimeout = time.Second
 	directLinkRequestTimeout = 120 * time.Millisecond
 	t.Cleanup(func() {
 		directLinkStagingQuota = previousQuota
-		directLinkStagingSlots = previousSlots
+		directLinkRequestSlots = previousSlots
 		directLinkBodyIdleTimeout = previousIdleTimeout
 		directLinkRequestTimeout = previousRequestTimeout
 	})
