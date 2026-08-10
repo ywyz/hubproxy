@@ -40,9 +40,11 @@ type AppConfig struct {
 	} `toml:"security"`
 
 	Access struct {
-		WhiteList []string `toml:"whiteList"`
-		BlackList []string `toml:"blackList"`
-		Proxy     string   `toml:"proxy"`
+		WhiteList           []string `toml:"whiteList"`
+		BlackList           []string `toml:"blackList"`
+		DirectLinkWhiteList []string `toml:"directLinkWhiteList"`
+		DirectLinkBlackList []string `toml:"directLinkBlackList"`
+		Proxy               string   `toml:"proxy"`
 	} `toml:"access"`
 
 	Download struct {
@@ -98,13 +100,17 @@ func DefaultConfig() *AppConfig {
 			BlackList: []string{},
 		},
 		Access: struct {
-			WhiteList []string `toml:"whiteList"`
-			BlackList []string `toml:"blackList"`
-			Proxy     string   `toml:"proxy"`
+			WhiteList           []string `toml:"whiteList"`
+			BlackList           []string `toml:"blackList"`
+			DirectLinkWhiteList []string `toml:"directLinkWhiteList"`
+			DirectLinkBlackList []string `toml:"directLinkBlackList"`
+			Proxy               string   `toml:"proxy"`
 		}{
-			WhiteList: []string{},
-			BlackList: []string{},
-			Proxy:     "",
+			WhiteList:           []string{},
+			BlackList:           []string{},
+			DirectLinkWhiteList: []string{},
+			DirectLinkBlackList: []string{},
+			Proxy:               "",
 		},
 		Download: struct {
 			MaxImages int `toml:"maxImages"`
@@ -178,6 +184,8 @@ func GetConfig() *AppConfig {
 	configCopy.Security.BlackList = append([]string(nil), appConfig.Security.BlackList...)
 	configCopy.Access.WhiteList = append([]string(nil), appConfig.Access.WhiteList...)
 	configCopy.Access.BlackList = append([]string(nil), appConfig.Access.BlackList...)
+	configCopy.Access.DirectLinkWhiteList = append([]string(nil), appConfig.Access.DirectLinkWhiteList...)
+	configCopy.Access.DirectLinkBlackList = append([]string(nil), appConfig.Access.DirectLinkBlackList...)
 	appConfigLock.RUnlock()
 
 	cachedConfig = &configCopy

@@ -14,6 +14,10 @@ host = "127.0.0.1"
 port = 5999
 
 [access]
+whiteList = ["legacy/*"]
+blackList = ["legacy/blocked"]
+directLinkWhiteList = ["downloads.example.com/files/*"]
+directLinkBlackList = ["downloads.example.com/files/private/*"]
 proxy = "socks5://127.0.0.1:1080"
 `)
 	if err := os.WriteFile(path, data, 0644); err != nil {
@@ -37,5 +41,17 @@ proxy = "socks5://127.0.0.1:1080"
 	}
 	if cfg.Access.Proxy != "" {
 		t.Fatalf("Access.Proxy = %q, want empty override", cfg.Access.Proxy)
+	}
+	if len(cfg.Access.WhiteList) != 1 || cfg.Access.WhiteList[0] != "legacy/*" {
+		t.Fatalf("Access.WhiteList = %#v", cfg.Access.WhiteList)
+	}
+	if len(cfg.Access.BlackList) != 1 || cfg.Access.BlackList[0] != "legacy/blocked" {
+		t.Fatalf("Access.BlackList = %#v", cfg.Access.BlackList)
+	}
+	if len(cfg.Access.DirectLinkWhiteList) != 1 || cfg.Access.DirectLinkWhiteList[0] != "downloads.example.com/files/*" {
+		t.Fatalf("Access.DirectLinkWhiteList = %#v", cfg.Access.DirectLinkWhiteList)
+	}
+	if len(cfg.Access.DirectLinkBlackList) != 1 || cfg.Access.DirectLinkBlackList[0] != "downloads.example.com/files/private/*" {
+		t.Fatalf("Access.DirectLinkBlackList = %#v", cfg.Access.DirectLinkBlackList)
 	}
 }

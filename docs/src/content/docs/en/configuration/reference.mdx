@@ -11,7 +11,7 @@ Default config path is `./config.toml` in the working directory. Override with `
 |-----|------|---------|-------------|
 | `host` | string | `0.0.0.0` | Listen address |
 | `port` | int | `5000` | Listen port |
-| `fileSize` | int | `2147483648` | Max single-file size (bytes), GitHub / Hugging Face URL proxy only |
+| `fileSize` | int | `2147483648` | Max single-file size (bytes) for GitHub, Hugging Face, and arbitrary HTTPS direct-link proxying |
 | `enableH2C` | bool | `false` | Enable HTTP/2 Cleartext |
 | `enableFrontend` | bool | `true` | Enable web UI (Vue SPA) |
 
@@ -43,11 +43,21 @@ Pulling one Docker image triggers multiple layer requests — each HTTP request 
 
 | Key | Description |
 |-----|-------------|
-| `whiteList` | Allowed repos/images (empty = no restriction) |
-| `blackList` | Blocked repos/images |
+| `whiteList` | Allowed repos/images (empty = no restriction; does not authorize direct links) |
+| `blackList` | Blocked repos/images (does not apply to direct links) |
+| `directLinkWhiteList` | Allowed arbitrary HTTPS direct links (missing or empty = deny all) |
+| `directLinkBlackList` | Blocked arbitrary HTTPS direct links |
 | `proxy` | Upstream SOCKS5 proxy, e.g. `socks5://127.0.0.1:1080` or `socks5://user:pass@host:1080` |
 
-Wildcards supported: `owner/*`, `*/repo-name`.
+Repository/image rules and direct-link rules use independent namespaces. Repository rules support wildcards such as `owner/*` and `*/repo-name`; direct-link rules match `{host}/{path-and-query}`, for example `downloads.example.com/releases/*`. Only `directLinkWhiteList = ["*/*"]` permits every host and path; do not use it on a public instance unless you intentionally operate an open download proxy.
+
+```toml
+[access]
+whiteList = ["trusted-org/*"]
+blackList = ["*/malicious-repo"]
+directLinkWhiteList = ["downloads.example.com/releases/*"]
+directLinkBlackList = ["downloads.example.com/releases/private/*"]
+```
 
 ## [download]
 

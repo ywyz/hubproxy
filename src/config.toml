@@ -43,6 +43,13 @@ blackList = [
     "baduser/*"
 ]
 
+# 通用 HTTPS 直链白名单（独立于仓库/镜像名单）
+# 缺失或为空时拒绝所有通用直链；仅 "*/*" 显式允许任意域名和路径
+directLinkWhiteList = []
+
+# 通用 HTTPS 直链黑名单；仅在白名单允许后用于排除具体域名或路径
+directLinkBlackList = []
+
 # 代理配置，支持有用户名/密码认证和无认证模式
 # 无认证: socks5://127.0.0.1:1080
 # 有认证: socks5://username:password@127.0.0.1:1080

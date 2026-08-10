@@ -14,11 +14,11 @@
 
 - 🐳 **Docker 镜像加速** — 兼容 Registry API v2，支持 Docker Hub、GHCR、Quay、GCR、registry.k8s.io；流式传输，Manifest / Token 缓存
 - 📦 **离线镜像包** — 无需本地 Docker，在线打包单镜像或批量 tar；流式下载 + 防抖设计
-- 📁 **文件下载加速** — GitHub Release、Raw、Git Clone、`api.github.com` 与任意 HTTPS 直链；`.sh` / `.ps1` 脚本内 URL 自动改写
+- 📁 **文件下载加速** — GitHub Release、Raw、Git Clone、`api.github.com` 与显式白名单授权的任意 HTTPS 直链；`.sh` / `.ps1` 脚本内 URL 自动改写
 - 🤖 **Hugging Face 加速** — 模型文件与 LFS 大文件下载
 - 🔍 **镜像搜索** — Web 界面与 API 搜索 Docker Hub 镜像、浏览标签
 - 🛡️ **智能限流** — 按真实客户端 IP 令牌桶限流（IPv6 按 `/64`）；可配置周期与配额
-- 🚫 **仓库访问控制** — IP 黑白名单（限流豁免 / 封禁）+ 镜像 / GitHub 仓库黑白名单，支持通配符
+- 🚫 **资源访问控制** — IP 黑白名单（限流豁免 / 封禁）+ 镜像 / GitHub 仓库名单 + 独立的 HTTPS 直链名单，支持通配符
 - 🌐 **上游 SOCKS5 代理** — 可选配置出站代理，适配特殊网络环境
 - 🖥️ **Web 界面** — 内置 Vue SPA，镜像搜索、离线包下载、标签浏览
 - ⚡ **轻量高效** — Go 单二进制，支持 `deb` / `rpm` / `apk` 与 Docker 多架构镜像
@@ -71,6 +71,8 @@ git clone https://yourdomain.com/https://github.com/sky22333/hubproxy.git
 ```
 
 > **生产环境建议**：绑定自有域名，通过 Caddy / Nginx 反代并开启 HTTPS，不要长期暴露裸 `http://IP:5000`。详见 [文档](https://docs.52013120.xyz/getting-started/quick-start/)。
+
+> **直链默认关闭**：任意 HTTPS 直链必须通过 `[access].directLinkWhiteList` 显式启用；缺失或空数组都会拒绝直链，只有 `"*/*"` 才会全量放行。
 
 ## 详细文档
 

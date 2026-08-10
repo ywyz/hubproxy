@@ -129,10 +129,10 @@ func (ac *AccessController) CheckDirectLinkAccess(matches []string) (allowed boo
 	}
 
 	cfg := config.GetConfig()
-	if len(cfg.Access.WhiteList) > 0 && !ac.checkDirectLinkList(matches[0], matches[1], cfg.Access.WhiteList) {
+	if len(cfg.Access.DirectLinkWhiteList) == 0 || !ac.checkDirectLinkList(matches[0], matches[1], cfg.Access.DirectLinkWhiteList) {
 		return false, "不在通用直链白名单内"
 	}
-	if len(cfg.Access.BlackList) > 0 && ac.checkDirectLinkList(matches[0], matches[1], cfg.Access.BlackList) {
+	if len(cfg.Access.DirectLinkBlackList) > 0 && ac.checkDirectLinkList(matches[0], matches[1], cfg.Access.DirectLinkBlackList) {
 		return false, "通用直链在黑名单内"
 	}
 	return true, ""
@@ -150,6 +150,9 @@ func (ac *AccessController) checkDirectLinkList(host, pathAndQuery string, list 
 			continue
 		}
 		patternHost, patternPath, hasPath := strings.Cut(item, "/")
+		if patternHost == "*" && (!hasPath || patternPath == "") {
+			continue
+		}
 		if patternHost != "*" {
 			canonicalPatternHost, validPatternHost := canonicalDirectLinkListAuthority(patternHost)
 			if !validPatternHost || canonicalPatternHost != host {
@@ -196,9 +199,6 @@ func canonicalDirectLinkListAuthority(authority string) (string, bool) {
 	}
 
 	port := parsed.Port()
-	if port == "443" {
-		port = ""
-	}
 	if port == "" {
 		return hostname, true
 	}
@@ -206,7 +206,10 @@ func canonicalDirectLinkListAuthority(authority string) (string, bool) {
 	if err != nil || portNumber < 1 || portNumber > 65535 {
 		return "", false
 	}
-	return net.JoinHostPort(strings.Trim(hostname, "[]"), port), true
+	if portNumber == 443 {
+		return hostname, true
+	}
+	return net.JoinHostPort(strings.Trim(hostname, "[]"), strconv.Itoa(portNumber)), true
 }
 
 // matchImageInList 检查Docker镜像是否在指定列表中

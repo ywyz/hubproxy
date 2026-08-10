@@ -18,9 +18,9 @@ HubProxy 是完全自托管的代理服务，数据与带宽由你自己控制�
 </details>
 
 <details>
-<summary>限流白名单和仓库白名单有什么区别？</summary>
+<summary>限流、仓库和直链白名单有什么区别？</summary>
 
-`[security].whiteList` 是限流豁免 IP，不影响可代理的仓库。`[access].whiteList` 控制允许代理哪些 Docker 镜像、GitHub 仓库与 Hugging Face 资源。两者独立配置。
+`[security].whiteList` 是限流豁免 IP，不影响可代理资源。`[access].whiteList` 控制允许代理哪些 Docker 镜像、GitHub 仓库与 Hugging Face 资源。`[access].directLinkWhiteList` 单独控制通用 HTTPS 直链，缺失或空数组时默认拒绝。三个名单彼此独立。
 
 </details>
 

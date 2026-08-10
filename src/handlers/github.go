@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/net/idna"
@@ -34,7 +38,7 @@ var (
 		regexp.MustCompile(`^(?:https?://)?cdn-lfs\.hf\.co(?:/spaces)?/([^/]+)/([^/]+)(?:/(.*))?`),
 		regexp.MustCompile(`^(?:https?://)?(github|opengraph)\.githubassets\.com/([^/]+)/.+?`),
 		// 通用 HTTPS 直链必须放在最后，避免覆盖上面的仓库级捕获规则。
-		// 捕获域名和路径，使现有 access 黑白名单仍可限制任意直链。
+		// 捕获域名和路径，交由独立的直链访问名单进行限制。
 		regexp.MustCompile(`^https://([^/?#]+)/(.+)`),
 	}
 )
@@ -95,15 +99,110 @@ var blockedDirectLinkNetworks = []netip.Prefix{
 
 var lookupDirectLinkIPs = net.DefaultResolver.LookupNetIP
 
-// Direct-link GET responses are fully staged before any bytes are sent so an
-// oversized response can still return 413. Serializing staging bounds aggregate
-// temporary-disk use to the configured per-file limit.
-var directLinkDownloadSlots = make(chan struct{}, 1)
+var (
+	errDirectLinkSpoolCapacity = errors.New("direct-link spool capacity exhausted")
+	directLinkStagingQuota     = &directLinkSpoolQuota{}
+	directLinkStagingSlots     = make(chan struct{}, 16)
+	directLinkBodyIdleTimeout  = 2 * time.Minute
+	directLinkRequestTimeout   = 30 * time.Minute
+)
 
 type proxyRequestState struct {
 	method  string
 	body    io.Reader
 	hasBody bool
+}
+
+// directLinkSpoolQuota bounds aggregate temporary-file content while still
+// allowing multiple small direct-link downloads to stage concurrently.
+type directLinkSpoolQuota struct {
+	mu   sync.Mutex
+	used int64
+}
+
+func (q *directLinkSpoolQuota) reserve(size, limit int64) bool {
+	if size <= 0 {
+		return true
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if limit <= 0 || q.used > limit || size > limit-q.used {
+		return false
+	}
+	q.used += size
+	return true
+}
+
+func (q *directLinkSpoolQuota) release(size int64) {
+	if size <= 0 {
+		return
+	}
+	q.mu.Lock()
+	q.used -= size
+	if q.used < 0 {
+		q.used = 0
+	}
+	q.mu.Unlock()
+}
+
+type directLinkQuotaWriter struct {
+	file     *os.File
+	quota    *directLinkSpoolQuota
+	limit    int64
+	reserved int64
+}
+
+func (w *directLinkQuotaWriter) Write(p []byte) (int, error) {
+	size := int64(len(p))
+	if !w.quota.reserve(size, w.limit) {
+		return 0, errDirectLinkSpoolCapacity
+	}
+	written, err := w.file.Write(p)
+	if unwritten := size - int64(written); unwritten > 0 {
+		w.quota.release(unwritten)
+	}
+	w.reserved += int64(written)
+	if err == nil && written != len(p) {
+		err = io.ErrShortWrite
+	}
+	return written, err
+}
+
+func (w *directLinkQuotaWriter) release() {
+	w.quota.release(w.reserved)
+	w.reserved = 0
+}
+
+type directLinkIdleReadCloser struct {
+	io.ReadCloser
+	timeout  time.Duration
+	timer    *time.Timer
+	timedOut atomic.Bool
+}
+
+func newDirectLinkIdleReadCloser(body io.ReadCloser, timeout time.Duration, cancel context.CancelFunc) *directLinkIdleReadCloser {
+	reader := &directLinkIdleReadCloser{ReadCloser: body, timeout: timeout}
+	reader.timer = time.AfterFunc(timeout, func() {
+		reader.timedOut.Store(true)
+		cancel()
+	})
+	return reader
+}
+
+func (r *directLinkIdleReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 && !r.timedOut.Load() {
+		r.timer.Reset(r.timeout)
+	}
+	if err != nil {
+		r.timer.Stop()
+	}
+	return n, err
+}
+
+func (r *directLinkIdleReadCloser) Close() error {
+	r.timer.Stop()
+	return r.ReadCloser.Close()
 }
 
 // GitHubProxyHandler GitHub代理处理器
@@ -201,9 +300,9 @@ func directLinkAccessMatches(targetURL *url.URL) ([]string, error) {
 	}
 	escapedPath := targetURL.EscapedPath()
 	lowerEscapedPath := strings.ToLower(escapedPath)
-	for _, encodedDelimiter := range []string{"%2f", "%5c", "%3f", "%23"} {
+	for _, encodedDelimiter := range []string{"%25", "%2f", "%5c", "%3f", "%23"} {
 		if strings.Contains(lowerEscapedPath, encodedDelimiter) {
-			return nil, fmt.Errorf("通用直链路径包含编码分隔符")
+			return nil, fmt.Errorf("通用直链路径包含编码分隔符或百分号")
 		}
 	}
 	decodedPath := targetURL.Path
@@ -247,9 +346,6 @@ func canonicalDirectLinkAuthority(targetURL *url.URL) (string, error) {
 	}
 
 	port := targetURL.Port()
-	if port == "443" {
-		port = ""
-	}
 	if port == "" {
 		return hostname, nil
 	}
@@ -257,19 +353,19 @@ func canonicalDirectLinkAuthority(targetURL *url.URL) (string, error) {
 	if err != nil || portNumber < 1 || portNumber > 65535 {
 		return "", fmt.Errorf("无效的通用直链端口")
 	}
-	return net.JoinHostPort(strings.Trim(hostname, "[]"), port), nil
+	if portNumber == 443 {
+		return hostname, nil
+	}
+	return net.JoinHostPort(strings.Trim(hostname, "[]"), strconv.Itoa(portNumber)), nil
 }
 
 // ProxyGitHubRequest 代理GitHub请求
 func ProxyGitHubRequest(c *gin.Context, u string) {
 	_, directLink := matchGitHubURL(u)
-	if directLink && c.Request.Method == http.MethodGet {
-		select {
-		case directLinkDownloadSlots <- struct{}{}:
-			defer func() { <-directLinkDownloadSlots }()
-		case <-c.Request.Context().Done():
-			return
-		}
+	if directLink {
+		requestContext, cancelRequest := context.WithTimeout(c.Request.Context(), directLinkRequestTimeout)
+		defer cancelRequest()
+		c.Request = c.Request.WithContext(requestContext)
 	}
 	requestState := proxyRequestState{
 		method: c.Request.Method,
@@ -302,6 +398,9 @@ func proxyGitHubWithRedirect(
 		}
 		directTargetAddresses, err = validateDirectLinkTarget(c.Request.Context(), targetURL)
 		if err != nil {
+			if finishDirectLinkContextError(c) {
+				return
+			}
 			c.String(http.StatusForbidden, err.Error())
 			return
 		}
@@ -328,6 +427,7 @@ func proxyGitHubWithRedirect(
 	var resp *http.Response
 	var requestErr error
 	var directTransport *http.Transport
+	var directRequestCancel context.CancelFunc
 	if directLink {
 		baseTransport, ok := baseHTTPClient.Transport.(*http.Transport)
 		if !ok {
@@ -340,7 +440,22 @@ func proxyGitHubWithRedirect(
 				requestErr = err
 				break
 			}
+			attemptContext, cancelAttempt := context.WithCancel(req.Context())
+			req = req.WithContext(attemptContext)
 			transport := baseTransport.Clone()
+			if baseTransport.Proxy != nil {
+				// Decide proxy/NO_PROXY routing from the original hostname before
+				// pinning the validated public address used for the actual dial.
+				proxyURL, proxyErr := baseTransport.Proxy(req)
+				if proxyErr != nil {
+					cancelAttempt()
+					requestErr = proxyErr
+					break
+				}
+				transport.Proxy = func(*http.Request) (*url.URL, error) {
+					return proxyURL, nil
+				}
+			}
 			if transport.TLSClientConfig == nil {
 				transport.TLSClientConfig = &tls.Config{}
 			} else {
@@ -363,8 +478,10 @@ func proxyGitHubWithRedirect(
 			resp, requestErr = httpClient.Do(req)
 			if requestErr == nil {
 				directTransport = transport
+				directRequestCancel = cancelAttempt
 				break
 			}
+			cancelAttempt()
 			transport.CloseIdleConnections()
 			if c.Request.Context().Err() != nil {
 				break
@@ -385,8 +502,14 @@ func proxyGitHubWithRedirect(
 	if directTransport != nil {
 		defer directTransport.CloseIdleConnections()
 	}
+	if directRequestCancel != nil {
+		defer directRequestCancel()
+	}
 	err := requestErr
 	if err != nil {
+		if directLink && finishDirectLinkContextError(c) {
+			return
+		}
 		c.String(http.StatusInternalServerError, fmt.Sprintf("server error %v", err))
 		return
 	}
@@ -492,18 +615,32 @@ func proxyGitHubWithRedirect(
 
 	responseBody := io.Reader(resp.Body)
 	if directLink && c.Request.Method == http.MethodGet {
+		select {
+		case directLinkStagingSlots <- struct{}{}:
+			defer func() { <-directLinkStagingSlots }()
+		case <-c.Request.Context().Done():
+			finishDirectLinkContextError(c)
+			return
+		default:
+			c.String(http.StatusServiceUnavailable, "直链暂存并发已满，请稍后重试")
+			return
+		}
 		staged, err := os.CreateTemp("", "hubproxy-direct-*")
 		if err != nil {
 			c.String(http.StatusInternalServerError, "无法暂存直链响应")
 			return
 		}
 		stagedName := staged.Name()
+		var quotaWriter *directLinkQuotaWriter
 		defer func() {
 			if err := staged.Close(); err != nil {
 				fmt.Printf("关闭直链临时文件失败: %v\n", err)
 			}
 			if err := os.Remove(stagedName); err != nil && !os.IsNotExist(err) {
 				fmt.Printf("删除直链临时文件失败: %v\n", err)
+			}
+			if quotaWriter != nil {
+				quotaWriter.release()
 			}
 		}()
 
@@ -516,8 +653,26 @@ func proxyGitHubWithRedirect(
 		if limit < int64(^uint64(0)>>1) {
 			readLimit++
 		}
-		written, copyErr := io.Copy(staged, io.LimitReader(resp.Body, readLimit))
+		quotaWriter = &directLinkQuotaWriter{
+			file:  staged,
+			quota: directLinkStagingQuota,
+			limit: readLimit,
+		}
+		responseBodyWithTimeout := newDirectLinkIdleReadCloser(resp.Body, directLinkBodyIdleTimeout, directRequestCancel)
+		resp.Body = responseBodyWithTimeout
+		written, copyErr := io.Copy(quotaWriter, io.LimitReader(responseBodyWithTimeout, readLimit))
+		if responseBodyWithTimeout.timedOut.Load() {
+			c.String(http.StatusGatewayTimeout, "读取直链响应超时")
+			return
+		}
+		if finishDirectLinkContextError(c) {
+			return
+		}
 		if copyErr != nil {
+			if errors.Is(copyErr, errDirectLinkSpoolCapacity) {
+				c.String(http.StatusServiceUnavailable, "直链暂存空间繁忙，请稍后重试")
+				return
+			}
 			c.String(http.StatusBadGateway, "读取直链响应失败")
 			return
 		}
@@ -604,6 +759,18 @@ func proxyGitHubWithRedirect(
 		if _, err := io.Copy(c.Writer, responseBody); err != nil {
 			fmt.Printf("转发响应体失败: %v\n", err)
 		}
+	}
+}
+
+func finishDirectLinkContextError(c *gin.Context) bool {
+	switch {
+	case errors.Is(c.Request.Context().Err(), context.DeadlineExceeded):
+		c.String(http.StatusGatewayTimeout, "通用直链请求超时")
+		return true
+	case errors.Is(c.Request.Context().Err(), context.Canceled):
+		return true
+	default:
+		return false
 	}
 }
 

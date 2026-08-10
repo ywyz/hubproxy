@@ -96,3 +96,114 @@ func TestDirectLinkAccessDoesNotTrimPathOrQuery(t *testing.T) {
 		t.Fatal("equivalent host and exact path did not match")
 	}
 }
+
+func TestDirectLinkAccessNormalizesNumericPorts(t *testing.T) {
+	controller := &AccessController{}
+	for _, test := range []struct {
+		name    string
+		host    string
+		allowed []string
+	}{
+		{name: "leading-zero default port", host: "downloads.example.com:0443", allowed: []string{"downloads.example.com/files/*"}},
+		{name: "leading-zero non-default port", host: "downloads.example.com:08443", allowed: []string{"downloads.example.com:8443/files/*"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !controller.checkDirectLinkList(test.host, "files/app.zip", test.allowed) {
+				t.Fatalf("host %q did not match numerically equivalent rule %q", test.host, test.allowed[0])
+			}
+		})
+	}
+}
+
+func TestDirectLinkAccessLegacyAllowlistDoesNotAuthorizeDirectLinks(t *testing.T) {
+	loadAccessConfig(t, `
+[access]
+whiteList = ["*/allowed-repo"]
+`)
+
+	if allowed, _ := GlobalAccessController.CheckDirectLinkAccess([]string{"downloads.example.com", "allowed-repo"}); allowed {
+		t.Fatal("legacy repository allowlist authorized a direct link")
+	}
+}
+
+func TestDirectLinkAccessDedicatedListsAreIsolated(t *testing.T) {
+	loadAccessConfig(t, `
+[access]
+whiteList = ["allowed/*"]
+blackList = ["downloads.example.com/files/public.zip"]
+directLinkWhiteList = ["downloads.example.com/files/*"]
+directLinkBlackList = ["downloads.example.com/files/private/*"]
+`)
+
+	if allowed, reason := GlobalAccessController.CheckDirectLinkAccess([]string{"downloads.example.com", "files/public.zip"}); !allowed {
+		t.Fatalf("dedicated direct-link allowlist entry denied: %s", reason)
+	}
+	if allowed, _ := GlobalAccessController.CheckDirectLinkAccess([]string{"downloads.example.com", "files/private/secret.zip"}); allowed {
+		t.Fatal("dedicated direct-link blacklist entry was allowed")
+	}
+	if allowed, reason := GlobalAccessController.CheckGitHubAccess([]string{"allowed", "repo"}); !allowed {
+		t.Fatalf("legacy repository allowlist stopped working: %s", reason)
+	}
+	if allowed, _ := GlobalAccessController.CheckGitHubAccess([]string{"other", "repo"}); allowed {
+		t.Fatal("legacy repository allowlist was bypassed")
+	}
+
+	loadAccessConfig(t, `
+[access]
+directLinkWhiteList = ["downloads.example.com/files/*"]
+directLinkBlackList = ["*/*"]
+`)
+	if allowed, reason := GlobalAccessController.CheckGitHubAccess([]string{"other", "repo"}); !allowed {
+		t.Fatalf("direct-link lists leaked into repository access control: %s", reason)
+	}
+	if allowed, reason := GlobalAccessController.CheckDockerAccess("other/app"); !allowed {
+		t.Fatalf("direct-link lists leaked into image access control: %s", reason)
+	}
+}
+
+func TestDirectLinkAccessEmptyAllowlistDenies(t *testing.T) {
+	loadAccessConfig(t, `
+[access]
+directLinkWhiteList = []
+`)
+
+	if allowed, _ := GlobalAccessController.CheckDirectLinkAccess([]string{"downloads.example.com", "files/app.zip"}); allowed {
+		t.Fatal("empty direct-link allowlist allowed a direct link")
+	}
+}
+
+func TestDirectLinkAccessRequiresExplicitGlobalWildcard(t *testing.T) {
+	t.Run("host wildcard alone is denied", func(t *testing.T) {
+		loadAccessConfig(t, `
+[access]
+directLinkWhiteList = ["*"]
+`)
+
+		if allowed, _ := GlobalAccessController.CheckDirectLinkAccess([]string{"downloads.example.com", "files/app.zip"}); allowed {
+			t.Fatal("host wildcard without an explicit path wildcard allowed all direct links")
+		}
+	})
+
+	t.Run("explicit host and path wildcard allows all", func(t *testing.T) {
+		loadAccessConfig(t, `
+[access]
+directLinkWhiteList = ["*/*"]
+`)
+
+		if allowed, reason := GlobalAccessController.CheckDirectLinkAccess([]string{"downloads.example.com", "files/app.zip"}); !allowed {
+			t.Fatalf("explicit global direct-link wildcard denied: %s", reason)
+		}
+	})
+}
+
+func loadAccessConfig(t *testing.T, data string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CONFIG_PATH", path)
+	if err := config.LoadConfig(); err != nil {
+		t.Fatal(err)
+	}
+}
