@@ -95,6 +95,17 @@ var blockedDirectLinkNetworks = []netip.Prefix{
 
 var lookupDirectLinkIPs = net.DefaultResolver.LookupNetIP
 
+// Direct-link GET responses are fully staged before any bytes are sent so an
+// oversized response can still return 413. Serializing staging bounds aggregate
+// temporary-disk use to the configured per-file limit.
+var directLinkDownloadSlots = make(chan struct{}, 1)
+
+type proxyRequestState struct {
+	method  string
+	body    io.Reader
+	hasBody bool
+}
+
 // GitHubProxyHandler GitHub代理处理器
 func GitHubProxyHandler(c *gin.Context) {
 	rawPath := strings.TrimPrefix(c.Request.URL.RequestURI(), "/")
@@ -121,18 +132,25 @@ func GitHubProxyHandler(c *gin.Context) {
 			c.String(http.StatusMethodNotAllowed, "通用直链仅支持 GET 和 HEAD")
 			return
 		}
+		if directLink && strings.Contains(c.GetHeader("Range"), ",") {
+			c.String(http.StatusRequestedRangeNotSatisfiable, "通用直链仅支持单区间 Range 请求")
+			return
+		}
 		allowed, reason := utils.GlobalAccessController.CheckGitHubAccess(matches)
 		if directLink {
 			allowed, reason = utils.GlobalAccessController.CheckDirectLinkAccess(matches)
 		}
 		if !allowed {
-			var repoPath string
-			if len(matches) >= 2 {
+			if directLink {
+				safePath, _, _ := strings.Cut(matches[1], "?")
+				fmt.Printf("通用直链 %s/%s 访问被拒绝: %s\n", matches[0], safePath, reason)
+			} else {
+				var repoPath string
 				username := matches[0]
 				repoName := strings.TrimSuffix(matches[1], ".git")
 				repoPath = username + "/" + repoName
+				fmt.Printf("GitHub仓库 %s 访问被拒绝: %s\n", repoPath, reason)
 			}
-			fmt.Printf("GitHub仓库 %s 访问被拒绝: %s\n", repoPath, reason)
 			c.String(http.StatusForbidden, reason)
 			return
 		}
@@ -245,11 +263,31 @@ func canonicalDirectLinkAuthority(targetURL *url.URL) (string, error) {
 // ProxyGitHubRequest 代理GitHub请求
 func ProxyGitHubRequest(c *gin.Context, u string) {
 	_, directLink := matchGitHubURL(u)
-	proxyGitHubWithRedirect(c, u, 0, directLink, true)
+	if directLink && c.Request.Method == http.MethodGet {
+		select {
+		case directLinkDownloadSlots <- struct{}{}:
+			defer func() { <-directLinkDownloadSlots }()
+		case <-c.Request.Context().Done():
+			return
+		}
+	}
+	requestState := proxyRequestState{
+		method: c.Request.Method,
+		body:   c.Request.Body,
+		hasBody: c.Request.Body != nil && c.Request.Body != http.NoBody &&
+			(c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) > 0),
+	}
+	proxyGitHubWithRedirect(c, u, 0, directLink, true, requestState)
 }
 
 // proxyGitHubWithRedirect 带重定向的GitHub代理请求
-func proxyGitHubWithRedirect(c *gin.Context, u string, redirectCount int, directLink, forwardSourceCredentials bool) {
+func proxyGitHubWithRedirect(
+	c *gin.Context,
+	u string,
+	redirectCount int,
+	directLink, forwardSourceCredentials bool,
+	requestState proxyRequestState,
+) {
 	const maxRedirects = 20
 	if redirectCount > maxRedirects {
 		c.String(http.StatusLoopDetected, "重定向次数过多，可能存在循环重定向")
@@ -297,7 +335,7 @@ func proxyGitHubWithRedirect(c *gin.Context, u string, redirectCount int, direct
 			return
 		}
 		for _, targetAddress := range directTargetAddresses {
-			req, err := newProxyRequest(c, u, true, false)
+			req, err := newProxyRequest(c, u, true, false, requestState)
 			if err != nil {
 				requestErr = err
 				break
@@ -333,7 +371,7 @@ func proxyGitHubWithRedirect(c *gin.Context, u string, redirectCount int, direct
 			}
 		}
 	} else {
-		req, err := newProxyRequest(c, u, false, forwardSourceCredentials)
+		req, err := newProxyRequest(c, u, false, forwardSourceCredentials, requestState)
 		if err != nil {
 			requestErr = err
 		} else {
@@ -389,20 +427,33 @@ func proxyGitHubWithRedirect(c *gin.Context, u string, redirectCount int, direct
 				return
 			}
 			_ = resp.Body.Close()
-			proxyGitHubWithRedirect(c, nextURL.String(), redirectCount+1, true, false)
+			proxyGitHubWithRedirect(
+				c,
+				nextURL.String(),
+				redirectCount+1,
+				true,
+				false,
+				proxyRequestState{method: requestState.method},
+			)
 			return
 		}
 
 		if matches != nil && !nextIsDirectLink {
 			copyResponseHeaders(c, resp.Header)
+			removeResponseEntityHeaders(c.Writer.Header())
 			c.Header("Location", "/"+nextURL.String())
 			c.Status(resp.StatusCode)
 			return
 		}
 
 		keepCredentials := forwardSourceCredentials && sameOrigin(currentURL, nextURL)
+		nextRequestState, redirectErr := redirectedProxyRequest(resp.StatusCode, requestState)
+		if redirectErr != nil {
+			c.String(http.StatusBadGateway, redirectErr.Error())
+			return
+		}
 		_ = resp.Body.Close()
-		proxyGitHubWithRedirect(c, nextURL.String(), redirectCount+1, false, keepCredentials)
+		proxyGitHubWithRedirect(c, nextURL.String(), redirectCount+1, false, keepCredentials, nextRequestState)
 		return
 	}
 
@@ -493,6 +544,11 @@ func proxyGitHubWithRedirect(c *gin.Context, u string, redirectCount int, direct
 	resp.Header.Del("Content-Security-Policy")
 	resp.Header.Del("Referrer-Policy")
 	resp.Header.Del("Strict-Transport-Security")
+	if directLink {
+		resp.Header.Set("Content-Type", "application/octet-stream")
+		resp.Header.Set("Content-Disposition", "attachment")
+		resp.Header.Set("X-Content-Type-Options", "nosniff")
+	}
 
 	// 获取真实域名
 	realHost := c.Request.Header.Get("X-Forwarded-Host")
@@ -559,12 +615,30 @@ func copyResponseHeaders(c *gin.Context, headers http.Header) {
 	}
 }
 
-func newProxyRequest(c *gin.Context, target string, directLink, forwardSourceCredentials bool) (*http.Request, error) {
-	requestBody := c.Request.Body
+func removeResponseEntityHeaders(headers http.Header) {
+	for _, name := range []string{
+		"Content-Encoding",
+		"Content-Length",
+		"Content-Range",
+		"Content-Type",
+		"Trailer",
+		"Transfer-Encoding",
+	} {
+		headers.Del(name)
+	}
+}
+
+func newProxyRequest(
+	c *gin.Context,
+	target string,
+	directLink, forwardSourceCredentials bool,
+	requestState proxyRequestState,
+) (*http.Request, error) {
+	requestBody := requestState.body
 	if directLink {
 		requestBody = nil
 	}
-	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, target, requestBody)
+	req, err := http.NewRequestWithContext(c.Request.Context(), requestState.method, target, requestBody)
 	if err != nil {
 		return nil, err
 	}
@@ -586,6 +660,27 @@ func newProxyRequest(c *gin.Context, target string, directLink, forwardSourceCre
 	}
 	req.Header.Del("Host")
 	return req, nil
+}
+
+func redirectedProxyRequest(statusCode int, current proxyRequestState) (proxyRequestState, error) {
+	next := proxyRequestState{method: current.method}
+	switch statusCode {
+	case http.StatusMovedPermanently, http.StatusFound:
+		if current.method != http.MethodGet && current.method != http.MethodHead {
+			next.method = http.MethodGet
+		}
+	case http.StatusSeeOther:
+		if current.method != http.MethodHead {
+			next.method = http.MethodGet
+		}
+	case http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		if current.hasBody {
+			return proxyRequestState{}, fmt.Errorf("上游重定向需要重放已消耗的请求体")
+		}
+	default:
+		return proxyRequestState{}, fmt.Errorf("不支持的上游重定向状态: %d", statusCode)
+	}
+	return next, nil
 }
 
 func sameOrigin(left, right *url.URL) bool {

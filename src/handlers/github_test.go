@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,6 +42,18 @@ func newGitHubProxyTestRouter(t *testing.T, configBody string) *gin.Engine {
 
 func performGitHubProxyRequest(router http.Handler, method, target string, headers http.Header) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, "/"+target, nil)
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	return recorder
+}
+
+func performGitHubProxyRequestWithBody(router http.Handler, method, target, body string, headers http.Header) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, "/"+target, strings.NewReader(body))
 	for key, values := range headers {
 		for _, value := range values {
 			req.Header.Add(key, value)
@@ -646,5 +660,270 @@ func TestGitHubDownloadStillFollowsExternalAssetRedirectWithoutLeakingAuthorizat
 	}
 	if got := <-cdnAuthorization; got != "" {
 		t.Fatalf("GitHub Authorization leaked to external asset host: %q", got)
+	}
+}
+
+func TestDirectLinkForcesNonExecutableAttachmentResponse(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Content-Disposition", "inline")
+		_, _ = w.Write([]byte("alert('from upstream')"))
+	}))
+	defer upstream.Close()
+
+	router := newGitHubProxyTestRouter(t, "")
+	upstreamURL := configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
+
+	recorder := performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/payload.js", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "application/octet-stream" {
+		t.Fatalf("Content-Type = %q, want application/octet-stream", got)
+	}
+	if got := recorder.Header().Get("Content-Disposition"); got != "attachment" {
+		t.Fatalf("Content-Disposition = %q, want attachment", got)
+	}
+	if got := recorder.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+}
+
+func TestRewrittenRedirectDropsHeadersForBodyThatIsNotForwarded(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://github.com/owner/repo/releases/download/v2/file.zip")
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Range", "bytes 0-7/8")
+		w.Header().Set("Content-Length", "8")
+		w.WriteHeader(http.StatusFound)
+		_, _ = w.Write([]byte("redirect"))
+	}))
+	defer upstream.Close()
+
+	router := newGitHubProxyTestRouter(t, "")
+	routeGlobalHTTPClientToTestUpstream(t, upstream)
+
+	recorder := performGitHubProxyRequest(router, http.MethodGet, "https://github.com/owner/repo/releases/download/v1/file.zip", nil)
+	if recorder.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302; body=%q", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Location"); got != "/https://github.com/owner/repo/releases/download/v2/file.zip" {
+		t.Fatalf("Location = %q, want rewritten GitHub URL", got)
+	}
+	for _, name := range []string{"Content-Length", "Content-Type", "Content-Encoding", "Content-Range", "Transfer-Encoding", "Trailer"} {
+		if value := recorder.Header().Get(name); value != "" {
+			t.Fatalf("%s = %q, want empty for bodyless redirect", name, value)
+		}
+	}
+}
+
+func TestDirectLinkRejectsMultipleByteRangesBeforeUpstreamRequest(t *testing.T) {
+	upstreamCalled := make(chan struct{}, 1)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled <- struct{}{}
+		w.Header().Set("Content-Type", "multipart/byteranges; boundary=test")
+		w.WriteHeader(http.StatusPartialContent)
+	}))
+	defer upstream.Close()
+
+	router := newGitHubProxyTestRouter(t, "")
+	upstreamURL := configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
+	headers := http.Header{"Range": {"bytes=0-1,4-5"}}
+
+	recorder := performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/file.bin", headers)
+	if recorder.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status = %d, want 416; body=%q", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case <-upstreamCalled:
+		t.Fatal("multi-range request reached the upstream")
+	default:
+	}
+}
+
+func TestDirectLinkDenialLogRedactsQuerySecrets(t *testing.T) {
+	router := newGitHubProxyTestRouter(t, "[access]\nwhiteList = [\"downloads.example.com/public/*\"]\n")
+
+	previousStdout := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = writer
+	t.Cleanup(func() {
+		os.Stdout = previousStdout
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+
+	recorder := performGitHubProxyRequest(
+		router,
+		http.MethodGet,
+		"https://downloads.example.com/private/file.zip?X-Amz-Signature=secret-signature",
+		nil,
+	)
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = previousStdout
+	captured, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%q", recorder.Code, recorder.Body.String())
+	}
+	logOutput := string(captured)
+	if strings.Contains(logOutput, "X-Amz-Signature") || strings.Contains(logOutput, "secret-signature") || strings.Contains(logOutput, "?") {
+		t.Fatalf("denial log leaked query data: %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "downloads.example.com/private/file.zip") {
+		t.Fatalf("denial log omitted safe target context: %q", logOutput)
+	}
+}
+
+func TestExternalRedirectAppliesHTTPMethodAndBodySemantics(t *testing.T) {
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			type receivedRequest struct {
+				method string
+				body   string
+			}
+			received := make(chan receivedRequest, 1)
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read upstream body: %v", err)
+				}
+				if r.Host == "github.com" {
+					if r.Method != http.MethodPost || string(body) != "payload" {
+						t.Errorf("initial request = %s %q, want POST payload", r.Method, body)
+					}
+					w.Header().Set("Location", "https://cdn.example.com/asset.zip")
+					w.WriteHeader(status)
+					return
+				}
+				received <- receivedRequest{method: r.Method, body: string(body)}
+				w.Header().Set("Content-Type", "application/octet-stream")
+				_, _ = w.Write([]byte("asset"))
+			}))
+			defer upstream.Close()
+
+			router := newGitHubProxyTestRouter(t, "")
+			routeGlobalHTTPClientToTestUpstream(t, upstream)
+
+			recorder := performGitHubProxyRequestWithBody(
+				router,
+				http.MethodPost,
+				"https://github.com/owner/repo/git-upload-pack",
+				"payload",
+				nil,
+			)
+			if recorder.Code != http.StatusOK || recorder.Body.String() != "asset" {
+				t.Fatalf("response = %d %q, want 200 asset", recorder.Code, recorder.Body.String())
+			}
+			got := <-received
+			if got.method != http.MethodGet || got.body != "" {
+				t.Fatalf("redirected request = %s %q, want GET with empty body", got.method, got.body)
+			}
+		})
+	}
+
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(http.StatusText(status)+" rejects consumed body", func(t *testing.T) {
+			redirected := make(chan struct{}, 1)
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.ReadAll(r.Body)
+				if r.Host == "github.com" {
+					w.Header().Set("Location", "https://cdn.example.com/asset.zip")
+					w.WriteHeader(status)
+					return
+				}
+				redirected <- struct{}{}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer upstream.Close()
+
+			router := newGitHubProxyTestRouter(t, "")
+			routeGlobalHTTPClientToTestUpstream(t, upstream)
+
+			recorder := performGitHubProxyRequestWithBody(
+				router,
+				http.MethodPost,
+				"https://github.com/owner/repo/git-upload-pack",
+				"payload",
+				nil,
+			)
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502; body=%q", recorder.Code, recorder.Body.String())
+			}
+			select {
+			case <-redirected:
+				t.Fatal("307/308 request with a consumed body was replayed")
+			default:
+			}
+		})
+	}
+}
+
+func TestDirectLinkStagingAllowsOnlyOneConcurrentDownload(t *testing.T) {
+	var requestNumber int32
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := atomic.AddInt32(&requestNumber, 1)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if current == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		} else {
+			secondStarted <- struct{}{}
+		}
+		_, _ = w.Write([]byte("file"))
+	}))
+	defer upstream.Close()
+
+	router := newGitHubProxyTestRouter(t, "[server]\nfileSize = 1024\n")
+	upstreamURL := configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
+	results := make(chan *httptest.ResponseRecorder, 2)
+
+	go func() {
+		results <- performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/first.bin", nil)
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first direct-link request did not reach the upstream")
+	}
+
+	go func() {
+		results <- performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/second.bin", nil)
+	}()
+	secondWasConcurrent := false
+	select {
+	case <-secondStarted:
+		secondWasConcurrent = true
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(releaseFirst)
+
+	if !secondWasConcurrent {
+		select {
+		case <-secondStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("queued direct-link request did not start after the first completed")
+		}
+	}
+	for range 2 {
+		recorder := <-results
+		if recorder.Code != http.StatusOK || recorder.Body.String() != "file" {
+			t.Fatalf("response = %d %q, want 200 file", recorder.Code, recorder.Body.String())
+		}
+	}
+	if secondWasConcurrent {
+		t.Fatal("two direct-link downloads staged concurrently")
 	}
 }
