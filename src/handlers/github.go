@@ -10,11 +10,13 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/net/idna"
 	"hubproxy/config"
 	"hubproxy/utils"
 )
@@ -65,6 +67,16 @@ var sourceCredentialHeaders = map[string]struct{}{
 	"Cookie2":             {},
 	"Proxy-Authorization": {},
 	"Www-Authenticate":    {},
+}
+
+var directLinkResponseAuthenticationHeaders = []string{
+	"Set-Cookie",
+	"Set-Cookie2",
+	"Clear-Site-Data",
+	"Www-Authenticate",
+	"Proxy-Authenticate",
+	"Authentication-Info",
+	"Proxy-Authentication-Info",
 }
 
 var blockedDirectLinkNetworks = []netip.Prefix{
@@ -144,12 +156,90 @@ func CheckGitHubURL(u string) []string {
 }
 
 func matchGitHubURL(u string) ([]string, bool) {
-	for index, exp := range githubExps {
+	for _, exp := range githubExps[:len(githubExps)-1] {
 		if matches := exp.FindStringSubmatch(u); matches != nil {
-			return matches[1:], index == len(githubExps)-1
+			return matches[1:], false
 		}
 	}
+	targetURL, err := url.Parse(u)
+	if err != nil {
+		return nil, false
+	}
+	matches, err := directLinkAccessMatches(targetURL)
+	if err == nil {
+		return matches, true
+	}
 	return nil, false
+}
+
+func directLinkAccessMatches(targetURL *url.URL) ([]string, error) {
+	if targetURL == nil || !strings.EqualFold(targetURL.Scheme, "https") || targetURL.Hostname() == "" || targetURL.User != nil {
+		return nil, fmt.Errorf("通用直链目标必须是无来源凭据的 HTTPS 地址")
+	}
+
+	authority, err := canonicalDirectLinkAuthority(targetURL)
+	if err != nil {
+		return nil, err
+	}
+	escapedPath := targetURL.EscapedPath()
+	lowerEscapedPath := strings.ToLower(escapedPath)
+	for _, encodedDelimiter := range []string{"%2f", "%5c", "%3f", "%23"} {
+		if strings.Contains(lowerEscapedPath, encodedDelimiter) {
+			return nil, fmt.Errorf("通用直链路径包含编码分隔符")
+		}
+	}
+	decodedPath := targetURL.Path
+	if decodedPath == "" || decodedPath == "/" || strings.Contains(decodedPath, "\\") {
+		return nil, fmt.Errorf("通用直链必须包含明确的文件路径")
+	}
+	for _, segment := range strings.Split(decodedPath, "/") {
+		if segment == "." || segment == ".." {
+			return nil, fmt.Errorf("通用直链路径包含目录遍历")
+		}
+	}
+	cleanedPath := path.Clean(decodedPath)
+	if cleanedPath != decodedPath || !strings.HasPrefix(cleanedPath, "/") {
+		return nil, fmt.Errorf("通用直链路径不规范")
+	}
+
+	pathAndQuery := strings.TrimPrefix(cleanedPath, "/")
+	if targetURL.RawQuery != "" {
+		pathAndQuery += "?" + targetURL.RawQuery
+	}
+	return []string{authority, pathAndQuery}, nil
+}
+
+func canonicalDirectLinkAuthority(targetURL *url.URL) (string, error) {
+	hostname := strings.TrimSuffix(targetURL.Hostname(), ".")
+	if hostname == "" || strings.Contains(hostname, "%") {
+		return "", fmt.Errorf("无效的通用直链主机名")
+	}
+	if address, err := netip.ParseAddr(hostname); err == nil {
+		address = address.Unmap()
+		hostname = address.String()
+		if address.Is6() {
+			hostname = "[" + hostname + "]"
+		}
+	} else {
+		asciiHostname, err := idna.Lookup.ToASCII(hostname)
+		if err != nil {
+			return "", fmt.Errorf("无效的通用直链主机名")
+		}
+		hostname = strings.ToLower(asciiHostname)
+	}
+
+	port := targetURL.Port()
+	if port == "443" {
+		port = ""
+	}
+	if port == "" {
+		return hostname, nil
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", fmt.Errorf("无效的通用直链端口")
+	}
+	return net.JoinHostPort(strings.Trim(hostname, "[]"), port), nil
 }
 
 // ProxyGitHubRequest 代理GitHub请求
@@ -165,14 +255,14 @@ func proxyGitHubWithRedirect(c *gin.Context, u string, redirectCount int, direct
 		c.String(http.StatusLoopDetected, "重定向次数过多，可能存在循环重定向")
 		return
 	}
-	var directTargetAddress netip.Addr
+	var directTargetAddresses []netip.Addr
 	if directLink {
 		targetURL, err := url.Parse(u)
 		if err != nil {
 			c.String(http.StatusForbidden, "无效的通用直链地址")
 			return
 		}
-		directTargetAddress, err = validateDirectLinkTarget(c.Request.Context(), targetURL)
+		directTargetAddresses, err = validateDirectLinkTarget(c.Request.Context(), targetURL)
 		if err != nil {
 			c.String(http.StatusForbidden, err.Error())
 			return
@@ -192,56 +282,72 @@ func proxyGitHubWithRedirect(c *gin.Context, u string, redirectCount int, direct
 		}
 	}
 
-	req, err := http.NewRequest(c.Request.Method, u, c.Request.Body)
-	if err != nil {
-		c.String(http.StatusInternalServerError, fmt.Sprintf("server error %v", err))
+	baseHTTPClient := utils.GetGlobalHTTPClient()
+	if baseHTTPClient == nil {
+		c.String(http.StatusInternalServerError, "HTTP 客户端尚未初始化")
 		return
 	}
-
-	// 通用直链仅转发下载所需的允许列表头，避免泄露代理来源凭据。
-	for key, values := range c.Request.Header {
-		if directLink {
-			if _, allowed := directLinkRequestHeaders[http.CanonicalHeaderKey(key)]; !allowed {
-				continue
-			}
-		} else if !forwardSourceCredentials {
-			if _, sensitive := sourceCredentialHeaders[http.CanonicalHeaderKey(key)]; sensitive {
-				continue
-			}
-		}
-		for _, value := range values {
-			req.Header.Add(key, value)
-		}
-	}
-	req.Header.Del("Host")
-
-	httpClient := *utils.GetGlobalHTTPClient()
+	var resp *http.Response
+	var requestErr error
+	var directTransport *http.Transport
 	if directLink {
-		transport, ok := httpClient.Transport.(*http.Transport)
+		baseTransport, ok := baseHTTPClient.Transport.(*http.Transport)
 		if !ok {
 			c.String(http.StatusInternalServerError, "通用直链 HTTP 传输配置无效")
 			return
 		}
-		transport = transport.Clone()
-		if transport.TLSClientConfig == nil {
-			transport.TLSClientConfig = &tls.Config{}
+		for _, targetAddress := range directTargetAddresses {
+			req, err := newProxyRequest(c, u, true, false)
+			if err != nil {
+				requestErr = err
+				break
+			}
+			transport := baseTransport.Clone()
+			if transport.TLSClientConfig == nil {
+				transport.TLSClientConfig = &tls.Config{}
+			} else {
+				transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+			}
+			transport.TLSClientConfig.ServerName = req.URL.Hostname()
+			originalHost := req.URL.Host
+			port := req.URL.Port()
+			if port == "" {
+				port = "443"
+			}
+			req.Host = originalHost
+			req.URL.Host = net.JoinHostPort(targetAddress.String(), port)
+
+			httpClient := *baseHTTPClient
+			httpClient.Transport = transport
+			httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			}
+			resp, requestErr = httpClient.Do(req)
+			if requestErr == nil {
+				directTransport = transport
+				break
+			}
+			transport.CloseIdleConnections()
+			if c.Request.Context().Err() != nil {
+				break
+			}
+		}
+	} else {
+		req, err := newProxyRequest(c, u, false, forwardSourceCredentials)
+		if err != nil {
+			requestErr = err
 		} else {
-			transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+			httpClient := *baseHTTPClient
+			httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			}
+			resp, requestErr = httpClient.Do(req)
 		}
-		transport.TLSClientConfig.ServerName = req.URL.Hostname()
-		originalHost := req.URL.Host
-		port := req.URL.Port()
-		if port == "" {
-			port = "443"
-		}
-		req.Host = originalHost
-		req.URL.Host = net.JoinHostPort(directTargetAddress.String(), port)
-		httpClient.Transport = transport
 	}
-	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
-		return http.ErrUseLastResponse
+	if directTransport != nil {
+		defer directTransport.CloseIdleConnections()
 	}
-	resp, err := httpClient.Do(req)
+	err := requestErr
 	if err != nil {
 		c.String(http.StatusInternalServerError, fmt.Sprintf("server error %v", err))
 		return
@@ -313,6 +419,18 @@ func proxyGitHubWithRedirect(c *gin.Context, u string, redirectCount int, direct
 
 	// 检查文件大小限制
 	cfg := config.GetConfig()
+	if directLink && resp.StatusCode == http.StatusPartialContent {
+		totalSize, ok := contentRangeTotal(resp.Header.Get("Content-Range"))
+		if !ok {
+			c.String(http.StatusBadGateway, "上游返回了无效的 Content-Range")
+			return
+		}
+		if totalSize > cfg.Server.FileSize {
+			c.String(http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("文件过大，限制大小: %d MB", cfg.Server.FileSize/(1024*1024)))
+			return
+		}
+	}
 	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
 		if size, err := strconv.ParseInt(contentLength, 10, 64); err == nil && size > cfg.Server.FileSize {
 			c.String(http.StatusRequestEntityTooLarge,
@@ -343,7 +461,11 @@ func proxyGitHubWithRedirect(c *gin.Context, u string, redirectCount int, direct
 			c.String(http.StatusRequestEntityTooLarge, "文件大小限制无效")
 			return
 		}
-		written, copyErr := io.Copy(staged, io.LimitReader(resp.Body, limit+1))
+		readLimit := limit
+		if limit < int64(^uint64(0)>>1) {
+			readLimit++
+		}
+		written, copyErr := io.Copy(staged, io.LimitReader(resp.Body, readLimit))
 		if copyErr != nil {
 			c.String(http.StatusBadGateway, "读取直链响应失败")
 			return
@@ -360,6 +482,11 @@ func proxyGitHubWithRedirect(c *gin.Context, u string, redirectCount int, direct
 		responseBody = staged
 		resp.Header.Del("Transfer-Encoding")
 		resp.Header.Set("Content-Length", strconv.FormatInt(written, 10))
+	}
+	if directLink {
+		for _, header := range directLinkResponseAuthenticationHeaders {
+			resp.Header.Del(header)
+		}
 	}
 
 	// 清理安全相关的头
@@ -432,15 +559,69 @@ func copyResponseHeaders(c *gin.Context, headers http.Header) {
 	}
 }
 
+func newProxyRequest(c *gin.Context, target string, directLink, forwardSourceCredentials bool) (*http.Request, error) {
+	requestBody := c.Request.Body
+	if directLink {
+		requestBody = nil
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, target, requestBody)
+	if err != nil {
+		return nil, err
+	}
+
+	// 通用直链仅转发下载所需的允许列表头，避免泄露代理来源凭据。
+	for key, values := range c.Request.Header {
+		if directLink {
+			if _, allowed := directLinkRequestHeaders[http.CanonicalHeaderKey(key)]; !allowed {
+				continue
+			}
+		} else if !forwardSourceCredentials {
+			if _, sensitive := sourceCredentialHeaders[http.CanonicalHeaderKey(key)]; sensitive {
+				continue
+			}
+		}
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	req.Header.Del("Host")
+	return req, nil
+}
+
 func sameOrigin(left, right *url.URL) bool {
 	return left != nil && right != nil &&
 		strings.EqualFold(left.Scheme, right.Scheme) &&
 		strings.EqualFold(left.Host, right.Host)
 }
 
-func validateDirectLinkTarget(ctx context.Context, targetURL *url.URL) (netip.Addr, error) {
+func contentRangeTotal(value string) (int64, bool) {
+	unit, rangeAndTotal, ok := strings.Cut(strings.TrimSpace(value), " ")
+	if !ok || !strings.EqualFold(unit, "bytes") {
+		return 0, false
+	}
+	rangePart, totalPart, ok := strings.Cut(rangeAndTotal, "/")
+	if !ok || rangePart == "" || totalPart == "" || totalPart == "*" {
+		return 0, false
+	}
+	total, err := strconv.ParseInt(totalPart, 10, 64)
+	if err != nil || total <= 0 {
+		return 0, false
+	}
+	startPart, endPart, ok := strings.Cut(rangePart, "-")
+	if !ok {
+		return 0, false
+	}
+	start, startErr := strconv.ParseInt(startPart, 10, 64)
+	end, endErr := strconv.ParseInt(endPart, 10, 64)
+	if startErr != nil || endErr != nil || start < 0 || end < start || end >= total {
+		return 0, false
+	}
+	return total, true
+}
+
+func validateDirectLinkTarget(ctx context.Context, targetURL *url.URL) ([]netip.Addr, error) {
 	if targetURL == nil || !strings.EqualFold(targetURL.Scheme, "https") || targetURL.Hostname() == "" || targetURL.User != nil {
-		return netip.Addr{}, fmt.Errorf("通用直链目标必须是无来源凭据的 HTTPS 地址")
+		return nil, fmt.Errorf("通用直链目标必须是无来源凭据的 HTTPS 地址")
 	}
 
 	hostname := strings.TrimSuffix(targetURL.Hostname(), ".")
@@ -448,23 +629,30 @@ func validateDirectLinkTarget(ctx context.Context, targetURL *url.URL) (netip.Ad
 	if address, err := netip.ParseAddr(hostname); err == nil {
 		addresses = append(addresses, address)
 	} else {
+		asciiHostname, err := idna.Lookup.ToASCII(hostname)
+		if err != nil {
+			return nil, fmt.Errorf("无效的通用直链主机名")
+		}
+		hostname = strings.ToLower(asciiHostname)
 		resolved, resolveErr := lookupDirectLinkIPs(ctx, "ip", hostname)
 		if resolveErr != nil || len(resolved) == 0 {
-			return netip.Addr{}, fmt.Errorf("无法解析通用直链目标地址")
+			return nil, fmt.Errorf("无法解析通用直链目标地址")
 		}
 		addresses = append(addresses, resolved...)
 	}
 
+	validated := make([]netip.Addr, 0, len(addresses))
 	for _, address := range addresses {
 		address = address.Unmap()
 		if !address.IsGlobalUnicast() || address.IsPrivate() {
-			return netip.Addr{}, fmt.Errorf("通用直链目标地址不可访问")
+			return nil, fmt.Errorf("通用直链目标地址不可访问")
 		}
 		for _, blocked := range blockedDirectLinkNetworks {
 			if blocked.Contains(address) {
-				return netip.Addr{}, fmt.Errorf("通用直链目标地址不可访问")
+				return nil, fmt.Errorf("通用直链目标地址不可访问")
 			}
 		}
+		validated = append(validated, address)
 	}
-	return addresses[0].Unmap(), nil
+	return validated, nil
 }

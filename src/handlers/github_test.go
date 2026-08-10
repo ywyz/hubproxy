@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"hubproxy/config"
@@ -85,6 +87,43 @@ func routeGlobalHTTPClientToTestUpstream(t *testing.T, upstream *httptest.Server
 		return (&net.Dialer{}).DialContext(ctx, network, upstreamAddress)
 	}
 	utils.GetGlobalHTTPClient().Transport = transport
+}
+
+func configureMultiAddressDirectLinkTestUpstream(t *testing.T, upstream *httptest.Server, hostname string) string {
+	t.Helper()
+
+	previousLookup := lookupDirectLinkIPs
+	lookupDirectLinkIPs = func(_ context.Context, _, host string) ([]netip.Addr, error) {
+		if strings.EqualFold(host, hostname) {
+			return []netip.Addr{
+				netip.MustParseAddr("1.1.1.1"),
+				netip.MustParseAddr("1.0.0.1"),
+			}, nil
+		}
+		return previousLookup(context.Background(), "ip", host)
+	}
+	t.Cleanup(func() { lookupDirectLinkIPs = previousLookup })
+
+	transport := upstream.Client().Transport.(*http.Transport).Clone()
+	transport.TLSClientConfig.InsecureSkipVerify = true // Test-only host mapping to httptest TLS.
+	upstreamAddress := upstream.Listener.Addr().String()
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		if host == "1.1.1.1" {
+			return nil, errors.New("first validated address is unavailable")
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, upstreamAddress)
+	}
+	utils.GetGlobalHTTPClient().Transport = transport
+
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "https://" + net.JoinHostPort(hostname, parsed.Port())
 }
 
 func TestCheckGitHubURL(t *testing.T) {
@@ -183,6 +222,33 @@ func TestDirectLinkForwardsOnlyAllowedRequestHeaders(t *testing.T) {
 	for _, name := range []string{"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key"} {
 		if value := got.Get(name); value != "" {
 			t.Fatalf("%s leaked to direct-link upstream: %q", name, value)
+		}
+	}
+}
+
+func TestDirectLinkStripsOriginAuthenticationResponseHeaders(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="file.zip"`)
+		w.Header().Set("Set-Cookie", "session=attacker; Secure; HttpOnly")
+		w.Header().Set("Www-Authenticate", `Basic realm="attacker"`)
+		_, _ = w.Write([]byte("file"))
+	}))
+	defer upstream.Close()
+
+	router := newGitHubProxyTestRouter(t, "")
+	upstreamURL := configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
+
+	recorder := performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/file.zip", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Disposition"); got == "" {
+		t.Fatal("download response header was removed")
+	}
+	for _, name := range []string{"Set-Cookie", "Set-Cookie2", "Www-Authenticate", "Proxy-Authenticate", "Authentication-Info"} {
+		if value := recorder.Header().Get(name); value != "" {
+			t.Fatalf("%s leaked from direct-link upstream: %q", name, value)
 		}
 	}
 }
@@ -310,6 +376,122 @@ func TestDirectLinkBodyLimitReturns413BeforeStreaming(t *testing.T) {
 	}
 }
 
+func TestDirectLinkBodyLimitUsesCompleteContentRangeSize(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "bytes=0-3" {
+			t.Errorf("Range = %q, want bytes=0-3", r.Header.Get("Range"))
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Range", "bytes 0-3/10")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("1234"))
+	}))
+	defer upstream.Close()
+
+	router := newGitHubProxyTestRouter(t, "[server]\nfileSize = 4\n")
+	upstreamURL := configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
+	headers := http.Header{"Range": {"bytes=0-3"}}
+
+	recorder := performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/large.bin", headers)
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body=%q", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "1234") {
+		t.Fatalf("partial content was streamed before the 413 response: %q", recorder.Body.String())
+	}
+}
+
+func TestDirectLinkRejectsInvalidPartialContentRange(t *testing.T) {
+	for _, contentRange := range []string{"", "bytes 0-3/*", "bytes 4-3/10"} {
+		t.Run(contentRange, func(t *testing.T) {
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				if contentRange != "" {
+					w.Header().Set("Content-Range", contentRange)
+				}
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write([]byte("1234"))
+			}))
+			defer upstream.Close()
+
+			router := newGitHubProxyTestRouter(t, "[server]\nfileSize = 10\n")
+			upstreamURL := configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
+			headers := http.Header{"Range": {"bytes=0-3"}}
+
+			recorder := performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/file.bin", headers)
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502; body=%q", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestDirectLinkBodyLimitDoesNotOverflowAtMaxInt64(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("file"))
+	}))
+	defer upstream.Close()
+
+	router := newGitHubProxyTestRouter(t, "[server]\nfileSize = 9223372036854775807\n")
+	upstreamURL := configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
+
+	recorder := performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/file.bin", nil)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "file" {
+		t.Fatalf("response = %d %q, want 200 file", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestDirectLinkStagingStopsWhenClientDisconnects(t *testing.T) {
+	started := make(chan struct{})
+	upstreamCanceled := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(started)
+		select {
+		case <-r.Context().Done():
+			close(upstreamCanceled)
+		case <-releaseUpstream:
+		}
+	}))
+	defer upstream.Close()
+
+	router := newGitHubProxyTestRouter(t, "[server]\nfileSize = 1048576\n")
+	upstreamURL := configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/"+upstreamURL+"/slow.bin", nil).WithContext(ctx)
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(recorder, req)
+		close(done)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		close(releaseUpstream)
+		t.Fatal("upstream request did not start")
+	}
+	cancel()
+
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(500 * time.Millisecond):
+		close(releaseUpstream)
+		<-done
+		t.Fatal("upstream request continued after the client disconnected")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy handler did not stop after client cancellation")
+	}
+}
+
 func TestDirectLinkAccessIgnoresHostCaseButPreservesPathAndQueryCase(t *testing.T) {
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -338,6 +520,74 @@ func TestDirectLinkAccessIgnoresHostCaseButPreservesPathAndQueryCase(t *testing.
 	queryCaseChanged := performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/Files/App.zip?token=ABC", nil)
 	if queryCaseChanged.Code != http.StatusForbidden {
 		t.Fatalf("different query case returned %d, want 403; body=%s", queryCaseChanged.Code, queryCaseChanged.Body.String())
+	}
+}
+
+func TestDirectLinkAccessRejectsAmbiguousOrTraversingPaths(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("private"))
+	}))
+	defer upstream.Close()
+
+	parsedUpstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowedResource := net.JoinHostPort("downloads.example.com", parsedUpstreamURL.Port()) + "/public/*"
+	router := newGitHubProxyTestRouter(t, "[access]\nwhiteList = [\""+allowedResource+"\"]\n")
+	upstreamURL := configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
+
+	for _, requestPath := range []string{
+		"/public/../private/file.zip",
+		"/public/%2e%2e/private/file.zip",
+		"/public%2F..%2Fprivate/file.zip",
+		"/public\\..\\private\\file.zip",
+		"/public/file%3Ftoken=secret.zip",
+		"/public/file%23fragment.zip",
+	} {
+		recorder := performGitHubProxyRequest(router, http.MethodGet, upstreamURL+requestPath, nil)
+		if recorder.Code != http.StatusForbidden {
+			t.Fatalf("%q status = %d, want 403; body=%q", requestPath, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestDirectLinkAccessNormalizesDefaultHTTPSPort(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("file"))
+	}))
+	defer upstream.Close()
+
+	router := newGitHubProxyTestRouter(t, "[access]\nwhiteList = [\"downloads.example.com:443/files/*\"]\n")
+	_ = configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
+
+	recorder := performGitHubProxyRequest(router, http.MethodGet, "https://downloads.example.com/files/app.zip", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	blockedRouter := newGitHubProxyTestRouter(t, "[access]\nblackList = [\"downloads.example.com/files/*\"]\n")
+	blocked := performGitHubProxyRequest(blockedRouter, http.MethodGet, "https://downloads.example.com:443/files/app.zip", nil)
+	if blocked.Code != http.StatusForbidden {
+		t.Fatalf("explicit :443 with portless blacklist returned %d, want 403; body=%s", blocked.Code, blocked.Body.String())
+	}
+}
+
+func TestDirectLinkRetriesValidatedTargetAddresses(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("file"))
+	}))
+	defer upstream.Close()
+
+	router := newGitHubProxyTestRouter(t, "")
+	upstreamURL := configureMultiAddressDirectLinkTestUpstream(t, upstream, "downloads.example.com")
+
+	recorder := performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/file.zip", nil)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "file" {
+		t.Fatalf("response = %d %q, want 200 file", recorder.Code, recorder.Body.String())
 	}
 }
 

@@ -84,3 +84,15 @@ blackList = ["allowed/blocked"]
 		t.Fatal("repo outside whitelist allowed")
 	}
 }
+
+func TestDirectLinkAccessDoesNotTrimPathOrQuery(t *testing.T) {
+	controller := &AccessController{}
+	allowed := []string{"downloads.example.com/files/app.zip"}
+
+	if controller.checkDirectLinkList("DOWNLOADS.EXAMPLE.COM:443", "files/app.zip ", allowed) {
+		t.Fatal("path ending in an encoded space matched the path without that space")
+	}
+	if !controller.checkDirectLinkList("downloads.example.com", "files/app.zip", allowed) {
+		t.Fatal("equivalent host and exact path did not match")
+	}
+}

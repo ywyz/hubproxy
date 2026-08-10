@@ -1,8 +1,13 @@
 package utils
 
 import (
+	"net"
+	"net/netip"
+	"net/url"
+	"strconv"
 	"strings"
 
+	"golang.org/x/net/idna"
 	"hubproxy/config"
 )
 
@@ -134,9 +139,8 @@ func (ac *AccessController) CheckDirectLinkAccess(matches []string) (allowed boo
 }
 
 func (ac *AccessController) checkDirectLinkList(host, pathAndQuery string, list []string) bool {
-	host = strings.TrimSpace(host)
-	pathAndQuery = strings.TrimSpace(pathAndQuery)
-	if host == "" || pathAndQuery == "" {
+	host, validHost := canonicalDirectLinkListAuthority(strings.TrimSpace(host))
+	if !validHost || pathAndQuery == "" {
 		return false
 	}
 
@@ -146,8 +150,11 @@ func (ac *AccessController) checkDirectLinkList(host, pathAndQuery string, list 
 			continue
 		}
 		patternHost, patternPath, hasPath := strings.Cut(item, "/")
-		if patternHost != "*" && !strings.EqualFold(patternHost, host) {
-			continue
+		if patternHost != "*" {
+			canonicalPatternHost, validPatternHost := canonicalDirectLinkListAuthority(patternHost)
+			if !validPatternHost || canonicalPatternHost != host {
+				continue
+			}
 		}
 		if !hasPath || patternPath == "" || patternPath == "*" {
 			return true
@@ -163,6 +170,43 @@ func (ac *AccessController) checkDirectLinkList(host, pathAndQuery string, list 
 		}
 	}
 	return false
+}
+
+func canonicalDirectLinkListAuthority(authority string) (string, bool) {
+	parsed, err := url.Parse("https://" + authority)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false
+	}
+	hostname := strings.TrimSuffix(parsed.Hostname(), ".")
+	if hostname == "" || strings.Contains(hostname, "%") {
+		return "", false
+	}
+	if address, err := netip.ParseAddr(hostname); err == nil {
+		address = address.Unmap()
+		hostname = address.String()
+		if address.Is6() {
+			hostname = "[" + hostname + "]"
+		}
+	} else {
+		asciiHostname, err := idna.Lookup.ToASCII(hostname)
+		if err != nil {
+			return "", false
+		}
+		hostname = strings.ToLower(asciiHostname)
+	}
+
+	port := parsed.Port()
+	if port == "443" {
+		port = ""
+	}
+	if port == "" {
+		return hostname, true
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", false
+	}
+	return net.JoinHostPort(strings.Trim(hostname, "[]"), port), true
 }
 
 // matchImageInList 检查Docker镜像是否在指定列表中
