@@ -11,7 +11,7 @@ HubProxy is an open proxy service — improper deployment creates abuse risk. Fo
 |-----------|-------------|
 | IP rate limiting | Per real client IP (IPv6 uses `/64`) |
 | IP allow/deny | `[security]` controls rate-limit exemption and blocking |
-| Repo access control | `[access]` restricts proxied images, GitHub repos, and Hugging Face resources |
+| Resource access control | `[access]` restricts proxied images, GitHub repos, Hugging Face resources, and HTTPS direct links |
 | Trusted proxies | Forward headers trusted only from private/local networks |
 | File size limit | `[server].fileSize` prevents oversized file abuse |
 | Offline download tokens | One-time tokens bound to IP and User-Agent, 2-minute TTL |
@@ -22,7 +22,7 @@ HubProxy has **no** admin login, Basic Auth, API keys, or Prometheus `/metrics`.
 
 ## Main Risks
 
-1. **Open proxy**: Public `0.0.0.0:5000` without `[access].whiteList` lets anyone use your bandwidth
+1. **Open proxy**: Public `0.0.0.0:5000` without `[access].whiteList` lets anyone use your bandwidth for repos or arbitrary HTTPS direct links
 2. **IP spoofing**: Reverse proxy that appends instead of overwriting `X-Forwarded-For` bypasses rate limits
 3. **Host injection**: Missing `X-Forwarded-Host` causes incorrect URLs in rewritten `.sh` scripts
 

@@ -1,9 +1,9 @@
 ﻿---
-title: GitHub Acceleration
-description: Accelerate GitHub Release, Raw, Clone, API, and Hugging Face downloads with HubProxy.
+title: GitHub and Direct-Link Acceleration
+description: Accelerate GitHub Release, Raw, Clone, API, Hugging Face, and arbitrary HTTPS direct-link downloads with HubProxy.
 ---
 
-Requests that do not match `/v2`, `/token`, `/api`, or other registered routes are handled by the GitHub proxy. Prefix the **full original URL** with your HubProxy host; if the URL matches a supported pattern, the handler reconstructs it and proxies to GitHub, Hugging Face, or other upstreams — otherwise it returns "invalid input".
+Requests that do not match `/v2`, `/token`, `/api`, or other registered routes are handled by the file proxy. Prefix the **full original URL** with your HubProxy host; if the URL matches a supported pattern, the handler reconstructs it and proxies to GitHub, Hugging Face, or another HTTPS upstream — otherwise it returns "invalid input".
 
 ## How to Accelerate
 
@@ -20,6 +20,9 @@ git clone https://example.com/https://github.com/owner/repo.git
 
 # API
 curl "https://example.com/https://api.github.com/repos/owner/repo/releases/latest"
+
+# Arbitrary HTTPS direct link
+curl -L -O "https://example.com/https://ollama.com/download/OllamaSetup.exe"
 ```
 
 ### Global Git acceleration
@@ -67,6 +70,7 @@ curl -L -O "https://example.com/github.com/owner/repo/releases/download/v1.0.0/a
 | Gist | `gist.github.com/...`, `gist.githubusercontent.com/...` |
 | Hugging Face | `huggingface.co/...`, `cdn-lfs.hf.co/...` |
 | GitHub Assets | `github.githubassets.com/...`, `opengraph.githubassets.com/...` |
+| Arbitrary HTTPS direct link | `https://ollama.com/download/OllamaSetup.exe`; a file path is required |
 
 ## Script Nesting
 
@@ -78,7 +82,11 @@ HubProxy can rewrite GitHub URLs inside `.sh` / `.ps1` install scripts (max 10MB
 |-------|-------------|
 | Web content | `text/html`, `application/xml`, etc. are blocked (403) — not for browsing GitHub pages |
 | File size | `[server].fileSize` caps single-file downloads (default 2GB) |
-| Repo access | `[access].whiteList` / `blackList` restrict proxied GitHub repos and Hugging Face resources |
+| Resource access | `[access].whiteList` / `blackList` restrict repos or direct links; direct links match as `{host}/{path}` |
+
+:::danger
+After arbitrary direct links are enabled, a public instance without `[access].whiteList` can be abused as an open download proxy. Allow only the hosts or paths you need. If a download redirects to a CDN, allow the redirect host as well.
+:::
 
 Large Release files support `wget -c` resume — see [Transfer Capabilities](/en/guides/capabilities/).
 
@@ -87,7 +95,7 @@ Large Release files support `wget -c` resume — see [Transfer Capabilities](/en
 fileSize = 2147483648
 
 [access]
-whiteList = ["trusted-org/*"]
+whiteList = ["trusted-org/*", "ollama.com/download/*"]
 blackList = ["*/malicious-repo"]
 ```
 

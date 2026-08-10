@@ -14,7 +14,7 @@
 
 - 🐳 **Docker 镜像加速** — 兼容 Registry API v2，支持 Docker Hub、GHCR、Quay、GCR、registry.k8s.io；流式传输，Manifest / Token 缓存
 - 📦 **离线镜像包** — 无需本地 Docker，在线打包单镜像或批量 tar；流式下载 + 防抖设计
-- 📁 **GitHub 文件加速** — Release、Raw、Git Clone、`api.github.com`；`.sh` / `.ps1` 脚本内 URL 自动改写
+- 📁 **文件下载加速** — GitHub Release、Raw、Git Clone、`api.github.com` 与任意 HTTPS 直链；`.sh` / `.ps1` 脚本内 URL 自动改写
 - 🤖 **Hugging Face 加速** — 模型文件与 LFS 大文件下载
 - 🔍 **镜像搜索** — Web 界面与 API 搜索 Docker Hub 镜像、浏览标签
 - 🛡️ **智能限流** — 按真实客户端 IP 令牌桶限流（IPv6 按 `/64`）；可配置周期与配额

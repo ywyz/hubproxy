@@ -1,9 +1,9 @@
 ﻿---
-title: GitHub 加速
-description: 使用 HubProxy 加速 GitHub Release、Raw、Clone、API 与 Hugging Face 下载。
+title: GitHub 与直链加速
+description: 使用 HubProxy 加速 GitHub Release、Raw、Clone、API、Hugging Face 与任意 HTTPS 直链下载。
 ---
 
-未匹配 `/v2`、`/token`、`/api` 等路由的请求，由 GitHub 代理处理器接管。使用时在**完整原始 URL** 前加上 HubProxy 域名；匹配支持的 URL 类型后，处理器还原地址并代理到 GitHub、Hugging Face 等上游，不匹配则返回「无效输入」。
+未匹配 `/v2`、`/token`、`/api` 等路由的请求，由文件代理处理器接管。使用时在**完整原始 URL** 前加上 HubProxy 域名；匹配支持的 URL 类型后，处理器还原地址并代理到 GitHub、Hugging Face 或其他 HTTPS 上游，不匹配则返回「无效输入」。
 
 ## 加速方式
 
@@ -20,6 +20,9 @@ git clone https://example.com/https://github.com/owner/repo.git
 
 # API
 curl "https://example.com/https://api.github.com/repos/owner/repo/releases/latest"
+
+# 任意 HTTPS 直链
+curl -L -O "https://example.com/https://ollama.com/download/OllamaSetup.exe"
 ```
 
 ### Git 全局加速
@@ -67,6 +70,7 @@ curl -L -O "https://example.com/github.com/owner/repo/releases/download/v1.0.0/a
 | Gist | `gist.github.com/...`、`gist.githubusercontent.com/...` |
 | Hugging Face | `huggingface.co/...`、`cdn-lfs.hf.co/...` |
 | GitHub Assets | `github.githubassets.com/...`、`opengraph.githubassets.com/...` |
+| 任意 HTTPS 直链 | `https://ollama.com/download/OllamaSetup.exe`；必须包含文件路径 |
 
 ## 脚本嵌套加速
 
@@ -78,7 +82,11 @@ HubProxy 可自动改写 `.sh` / `.ps1` 安装脚本中的 GitHub URL（脚本�
 |------|------|
 | 网页内容 | `text/html`、`application/xml` 等网页类型会被拒绝（403），不能用来加速 GitHub 网页浏览 |
 | 文件大小 | `[server].fileSize` 控制单文件上限，默认 2GB |
-| 仓库访问 | `[access].whiteList` / `blackList` 限制可代理的 GitHub 仓库与 Hugging Face 资源 |
+| 资源访问 | `[access].whiteList` / `blackList` 限制可代理的仓库或直链；直链按 `{域名}/{路径}` 匹配 |
+
+:::danger
+启用任意直链后，未配置 `[access].whiteList` 的公网实例可能被当作开放下载代理滥用。强烈建议只允许所需域名或路径；若下载会跳转到 CDN，还需将跳转后的域名加入白名单。
+:::
 
 Release 等大文件支持 `wget -c` 断点续传，见 [传输特性](/guides/capabilities/)。
 
@@ -87,7 +95,7 @@ Release 等大文件支持 `wget -c` 断点续传，见 [传输特性](/guides/c
 fileSize = 2147483648
 
 [access]
-whiteList = ["trusted-org/*"]
+whiteList = ["trusted-org/*", "ollama.com/download/*"]
 blackList = ["*/malicious-repo"]
 ```
 

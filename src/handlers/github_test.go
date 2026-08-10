@@ -13,6 +13,8 @@ func TestCheckGitHubURL(t *testing.T) {
 		{"raw", "https://raw.githubusercontent.com/user/repo/main/file.sh", "user", "repo"},
 		{"api", "https://api.github.com/repos/user/repo/releases/latest", "user", "repo"},
 		{"huggingface", "https://huggingface.co/user/model/resolve/main/file", "user", "model/resolve/main/file"},
+		{"direct", "https://ollama.com/download/OllamaSetup.exe", "ollama.com", "download/OllamaSetup.exe"},
+		{"direct with query", "https://downloads.example.com/files/app.zip?arch=amd64", "downloads.example.com", "files/app.zip?arch=amd64"},
 	}
 
 	for _, tt := range tests {
@@ -25,11 +27,17 @@ func TestCheckGitHubURL(t *testing.T) {
 	}
 }
 
-func TestCheckGitHubURLRejectsOtherHosts(t *testing.T) {
-	if got := CheckGitHubURL("https://example.com/user/repo/file"); got != nil {
-		t.Fatalf("unexpected match: %#v", got)
+func TestCheckGitHubURLRejectsInvalidDirectLinks(t *testing.T) {
+	tests := []string{
+		"http://downloads.example.com/files/app.zip",
+		"ftp://downloads.example.com/files/app.zip",
+		"https://downloads.example.com",
+		"not-a-url",
 	}
-	if got := CheckGitHubURL("https://download.docker.com/linux/static/stable/x86_64/docker.tgz"); got != nil {
-		t.Fatalf("download.docker.com should be rejected: %#v", got)
+
+	for _, rawURL := range tests {
+		if got := CheckGitHubURL(rawURL); got != nil {
+			t.Fatalf("CheckGitHubURL(%q) unexpectedly matched: %#v", rawURL, got)
+		}
 	}
 }

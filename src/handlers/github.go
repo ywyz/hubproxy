@@ -25,6 +25,9 @@ var (
 		regexp.MustCompile(`^(?:https?://)?huggingface\.co(?:/spaces)?/([^/]+)/(.+)`),
 		regexp.MustCompile(`^(?:https?://)?cdn-lfs\.hf\.co(?:/spaces)?/([^/]+)/([^/]+)(?:/(.*))?`),
 		regexp.MustCompile(`^(?:https?://)?(github|opengraph)\.githubassets\.com/([^/]+)/.+?`),
+		// 通用 HTTPS 直链必须放在最后，避免覆盖上面的仓库级捕获规则。
+		// 捕获域名和路径，使现有 access 黑白名单仍可限制任意直链。
+		regexp.MustCompile(`^https://([^/?#]+)/(.+)`),
 	}
 )
 
