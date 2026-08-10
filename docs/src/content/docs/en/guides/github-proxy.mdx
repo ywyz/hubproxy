@@ -81,8 +81,11 @@ HubProxy can rewrite GitHub URLs inside `.sh` / `.ps1` install scripts (max 10MB
 | Limit | Description |
 |-------|-------------|
 | Web content | `text/html`, `application/xml`, etc. are blocked (403) — not for browsing GitHub pages |
-| File size | `[server].fileSize` caps single-file downloads (default 2GB) |
-| Resource access | `[access].whiteList` / `blackList` restrict repos or direct links; direct links match as `{host}/{path}` |
+| Direct-link methods | Only `GET` and `HEAD` are allowed; Git smart HTTP and existing GitHub/Hugging Face methods are unchanged |
+| Direct-link request headers | Only download headers such as `Range`, validators, `Accept`, and `User-Agent` are forwarded; `Authorization`, `Proxy-Authorization`, `Cookie`, and arbitrary custom headers are never forwarded |
+| Redirects | The HTTP client does not auto-follow. Relative `Location` values are resolved against the current URL, and every hop is rechecked for HTTPS, access-list permission, and a public target address |
+| File size | `[server].fileSize` caps single-file downloads (default 2GB). A direct-link GET is staged in a system temporary file while reading at most the limit plus one byte, so an oversized response returns 413 before any upstream body is sent; GitHub/Hugging Face keep their existing streaming and Range behavior |
+| Resource access | `[access].whiteList` / `blackList` restrict repos or direct links; direct links match as `{host}/{path-and-query}`, with case-insensitive hosts and case-sensitive paths and queries |
 
 :::danger
 After arbitrary direct links are enabled, a public instance without `[access].whiteList` can be abused as an open download proxy. Allow only the hosts or paths you need. If a download redirects to a CDN, allow the redirect host as well.

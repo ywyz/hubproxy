@@ -117,6 +117,54 @@ func (ac *AccessController) CheckGitHubAccess(matches []string) (allowed bool, r
 	return true, ""
 }
 
+// CheckDirectLinkAccess 检查通用直链访问权限。主机名不区分大小写，路径和查询保持大小写敏感。
+func (ac *AccessController) CheckDirectLinkAccess(matches []string) (allowed bool, reason string) {
+	if len(matches) < 2 {
+		return false, "无效的通用直链格式"
+	}
+
+	cfg := config.GetConfig()
+	if len(cfg.Access.WhiteList) > 0 && !ac.checkDirectLinkList(matches[0], matches[1], cfg.Access.WhiteList) {
+		return false, "不在通用直链白名单内"
+	}
+	if len(cfg.Access.BlackList) > 0 && ac.checkDirectLinkList(matches[0], matches[1], cfg.Access.BlackList) {
+		return false, "通用直链在黑名单内"
+	}
+	return true, ""
+}
+
+func (ac *AccessController) checkDirectLinkList(host, pathAndQuery string, list []string) bool {
+	host = strings.TrimSpace(host)
+	pathAndQuery = strings.TrimSpace(pathAndQuery)
+	if host == "" || pathAndQuery == "" {
+		return false
+	}
+
+	for _, item := range list {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		patternHost, patternPath, hasPath := strings.Cut(item, "/")
+		if patternHost != "*" && !strings.EqualFold(patternHost, host) {
+			continue
+		}
+		if !hasPath || patternPath == "" || patternPath == "*" {
+			return true
+		}
+		if pathAndQuery == patternPath {
+			return true
+		}
+		if strings.HasSuffix(patternPath, "*") && strings.HasPrefix(pathAndQuery, strings.TrimSuffix(patternPath, "*")) {
+			return true
+		}
+		if strings.HasPrefix(pathAndQuery, patternPath+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // matchImageInList 检查Docker镜像是否在指定列表中
 func (ac *AccessController) matchImageInList(imageInfo DockerImageInfo, list []string) bool {
 	fullName := strings.ToLower(imageInfo.FullName)
