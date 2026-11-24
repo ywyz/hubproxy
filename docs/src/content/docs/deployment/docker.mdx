@@ -60,7 +60,9 @@ printf 'version=%s\n' "$version"
 ```bash
 cd /opt/hubproxy
 umask 077
-test -e compose.yaml || install -m 600 compose.yaml.candidate compose.yaml
+if [[ ! -e compose.yaml && ! -e compose.yml && ! -e docker-compose.yaml && ! -e docker-compose.yml ]]; then
+  install -m 600 compose.yaml.candidate compose.yaml
+fi
 touch runtime.env
 chmod 600 runtime.env
 ```
