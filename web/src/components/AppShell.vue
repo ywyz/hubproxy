@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
-import { Container, Github, Menu, Rocket, Search, X, Zap } from 'lucide-vue-next'
+import { Container, Github, LogIn, Menu, Rocket, Search, X, Zap } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
 import ThemeToggle from '@/components/ThemeToggle.vue'
 
@@ -68,6 +68,10 @@ onMounted(() => {
             <component :is="link.icon" class="size-4" />
             {{ link.label }}
           </RouterLink>
+          <a href="/login" class="inline-flex items-center gap-1.5 rounded-full px-4 py-2 text-[15px] text-muted-foreground hover:bg-accent hover:text-foreground">
+            <LogIn class="size-4" />
+            下载账户
+          </a>
           <ThemeToggle :is-dark="isDark" button-class="ml-1" @toggle="toggleTheme" />
         </nav>
 
@@ -96,6 +100,10 @@ onMounted(() => {
               <component :is="link.icon" class="size-4" />
               {{ link.label }}
             </RouterLink>
+            <a href="/login" class="inline-flex items-center gap-2 rounded-full px-3.5 py-2 text-[15px] text-muted-foreground hover:bg-accent">
+              <LogIn class="size-4" />
+              下载账户
+            </a>
           </div>
         </div>
       </Transition>

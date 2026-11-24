@@ -33,7 +33,7 @@ curl -L -O "https://example.com/https://cdn-lfs.hf.co/user/model-repo/abc123..."
 与 [GitHub 加速](/guides/github-proxy/) 相同：
 
 - 不支持网页浏览（HTML 会被拒绝）
-- 单文件受 `[server].fileSize` 限制
+- 超过 `[server].fileSize` 门槛需登录，已登录下载不限大小
 - 与 GitHub 相同，**支持** `Range` 断点续传与多连接分片（见 [传输特性](/guides/capabilities/)）
 - 受 `[access]` 仓库黑白名单约束
 

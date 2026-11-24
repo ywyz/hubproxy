@@ -3,7 +3,7 @@
 host = "0.0.0.0"
 # 监听端口
 port = 5000
-# Github文件大小限制（字节），默认2GB
+# 匿名单文件下载上限（字节），最多 2 GiB；登录后不限大小
 fileSize = 2147483648
 # HTTP/2 多路复用
 enableH2C = false
@@ -43,6 +43,48 @@ blackList = [
     "baduser/*"
 ]
 
+# 镜像源和通用 HTTPS 直链共用此白名单。清空数组即可关闭这两种入口。
+directLinkWhiteList = [
+    # Ubuntu APT：主仓库、安全更新、其他架构
+    "archive.ubuntu.com/ubuntu/*",
+    "security.ubuntu.com/ubuntu/*",
+    "ports.ubuntu.com/ubuntu-ports/*",
+    # Debian APT：主仓库、安全更新与官方列出的 Fastly 端点
+    "deb.debian.org/debian/*",
+    "deb.debian.org/debian-security/*",
+    "security.debian.org/debian-security/*",
+    "cdn-fastly.deb.debian.org/debian/*",
+    "cdn-fastly.deb.debian.org/debian-security/*",
+    # Omarchy stable（x86_64）
+    "pkgs.omarchy.org/stable/x86_64/*",
+    "stable-mirror.omarchy.org/core/os/x86_64/*",
+    "stable-mirror.omarchy.org/extra/os/x86_64/*",
+    "stable-mirror.omarchy.org/multilib/os/x86_64/*",
+    # Arch Linux（x86_64）
+    "geo.mirror.pkgbuild.com/core/os/x86_64/*",
+    "geo.mirror.pkgbuild.com/extra/os/x86_64/*",
+    "geo.mirror.pkgbuild.com/multilib/os/x86_64/*",
+    # Alpine：仅开放指定稳定版本的软件包目录
+    "dl-cdn.alpinelinux.org/alpine/v3.22/main/*",
+    "dl-cdn.alpinelinux.org/alpine/v3.22/community/*",
+    "dl-cdn.alpinelinux.org/alpine/v3.23/main/*",
+    "dl-cdn.alpinelinux.org/alpine/v3.23/community/*",
+    "dl-cdn.alpinelinux.org/alpine/v3.24/main/*",
+    "dl-cdn.alpinelinux.org/alpine/v3.24/community/*",
+    "dl-cdn.alpinelinux.org/alpine/latest-stable/main/*",
+    "dl-cdn.alpinelinux.org/alpine/latest-stable/community/*",
+    # Rocky Linux：主版本目录可随小版本更新继续使用
+    "dl.rockylinux.org/pub/rocky/9/BaseOS/*",
+    "dl.rockylinux.org/pub/rocky/9/AppStream/*",
+    "dl.rockylinux.org/pub/rocky/9/extras/*",
+    "dl.rockylinux.org/pub/rocky/10/BaseOS/*",
+    "dl.rockylinux.org/pub/rocky/10/AppStream/*",
+    "dl.rockylinux.org/pub/rocky/10/extras/*",
+]
+
+# 通用 HTTPS 直链黑名单；仅在白名单允许后用于排除具体域名或路径
+directLinkBlackList = []
+
 # 代理配置，支持有用户名/密码认证和无认证模式
 # 无认证: socks5://127.0.0.1:1080
 # 有认证: socks5://username:password@127.0.0.1:1080
@@ -52,6 +94,12 @@ proxy = ""
 [download]
 # 批量下载离线镜像数量限制
 maxImages = 10
+
+[downloadAuth]
+# 本地下载登录账号，用户名和密码都配置后才会启用下载登录；不设默认密码
+# 可通过环境变量 HUBPROXY_DOWNLOAD_USERNAME / HUBPROXY_DOWNLOAD_PASSWORD 覆盖
+username = ""
+password = ""
 
 # Registry映射配置，支持多种镜像仓库上游
 [registries]

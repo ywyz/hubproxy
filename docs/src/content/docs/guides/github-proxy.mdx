@@ -1,9 +1,9 @@
 ﻿---
-title: GitHub 加速
-description: 使用 HubProxy 加速 GitHub Release、Raw、Clone、API 与 Hugging Face 下载。
+title: GitHub 与直链加速
+description: 使用 HubProxy 加速 GitHub Release、Raw、Clone、API、Hugging Face 与任意 HTTPS 直链下载。
 ---
 
-未匹配 `/v2`、`/token`、`/api` 等路由的请求，由 GitHub 代理处理器接管。使用时在**完整原始 URL** 前加上 HubProxy 域名；匹配支持的 URL 类型后，处理器还原地址并代理到 GitHub、Hugging Face 等上游，不匹配则返回「无效输入」。
+未匹配 `/v2`、`/token`、`/api` 等路由的请求，由文件代理处理器接管。使用时在**完整原始 URL** 前加上 HubProxy 域名；匹配支持的 URL 类型后，处理器还原地址并代理到 GitHub、Hugging Face 或其他 HTTPS 上游，不匹配则返回「无效输入」。
 
 ## 加速方式
 
@@ -20,7 +20,14 @@ git clone https://example.com/https://github.com/owner/repo.git
 
 # API
 curl "https://example.com/https://api.github.com/repos/owner/repo/releases/latest"
+
+# 任意 HTTPS 直链
+curl -L -O "https://example.com/https://ollama.com/download/OllamaSetup.exe"
 ```
+
+:::note
+通用 HTTPS 直链只放行 `[access].directLinkWhiteList` 中的目标。Docker 镜像和仓库配置已列入部分 Linux 软件源目录，其他上游需另行添加。名单缺失或为空时，所有通用直链都会返回 403。GitHub、Hugging Face、Docker 仓库使用独立的 `whiteList` / `blackList`。[预置软件包镜像源](../package-mirrors/)
+:::
 
 ### Git 全局加速
 
@@ -67,18 +74,29 @@ curl -L -O "https://example.com/github.com/owner/repo/releases/download/v1.0.0/a
 | Gist | `gist.github.com/...`、`gist.githubusercontent.com/...` |
 | Hugging Face | `huggingface.co/...`、`cdn-lfs.hf.co/...` |
 | GitHub Assets | `github.githubassets.com/...`、`opengraph.githubassets.com/...` |
+| 任意 HTTPS 直链 | `https://ollama.com/download/OllamaSetup.exe`；必须包含文件路径 |
 
 ## 脚本嵌套加速
 
-HubProxy 可自动改写 `.sh` / `.ps1` 安装脚本中的 GitHub URL（脚本最大 10MB）。反代部署时需正确设置 `X-Forwarded-Host`，详见 [反向代理配置](/deployment/reverse-proxy/)。
+HubProxy 可自动改写 `.sh` / `.ps1` 安装脚本中的 GitHub URL（脚本最大 10MB）。反代部署时需正确设置 `Host`，详见 [反向代理配置](/deployment/reverse-proxy/)。
 
 ## 限制与拒绝
 
 | 限制 | 说明 |
 |------|------|
 | 网页内容 | `text/html`、`application/xml` 等网页类型会被拒绝（403），不能用来加速 GitHub 网页浏览 |
-| 文件大小 | `[server].fileSize` 控制单文件上限，默认 2GB |
-| 仓库访问 | `[access].whiteList` / `blackList` 限制可代理的 GitHub 仓库与 Hugging Face 资源 |
+| 通用直链方法 | 只允许 `GET`、`HEAD`；Git smart HTTP 与 GitHub/Hugging Face 仍保留原有方法 |
+| 通用直链请求头 | 只转发下载所需的允许列表头（如单区间 `Range`、条件请求头、`Accept`、`User-Agent`）；多区间请求返回 416，且不会转发 `Authorization`、`Proxy-Authorization`、`Cookie` 或任意自定义头 |
+| 通用直链响应头 | 强制使用 `application/octet-stream`、`Content-Disposition: attachment` 和 `X-Content-Type-Options: nosniff`；同时移除 `Set-Cookie`、`WWW-Authenticate`、`Proxy-Authenticate` 等来源站认证状态头 |
+| 重定向 | 通用直链和镜像逐跳检查 HTTPS、公网地址与访问规则。GitHub 和 Hugging Face 的同源仓库跳转可返回代理内地址。跨源跳转由服务器跟随，固定公网目标 IP，并移除来源站凭据。已识别的目标仓库也须通过访问规则。需要重放已消费请求体的 `307`/`308` 返回 502。 |
+| 文件大小 | 默认匿名下载不超过 2 GiB 的文件。超过门槛返回 401；登录后直接流式传输，不设文件大小上限。分段按 `Content-Range` 的完整文件大小判断。匿名请求遇到未知长度时先暂存，所有请求共用磁盘配额。直链最多同时处理 16 个请求，资源占满时返回 503。 |
+| 资源访问 | `[access].whiteList` / `blackList` 仅限制仓库和镜像；`directLinkWhiteList` / `directLinkBlackList` 独立限制通用直链。直链白名单缺失或为空时默认拒绝。直链先拒绝目录遍历、编码分隔符和递归编码的百分号，再按 `{域名}/{路径和查询}` 匹配。域名不区分大小写，端口按数值规范化，因此省略 HTTPS 端口、`:443` 与 `:0443` 等价；路径与查询保持大小写敏感且不做空白裁剪 |
+
+HubProxy 会在本地解析直链域名，验证全部候选地址均为公网地址，并按候选地址依次尝试连接。代理与 `NO_PROXY` 会先按原始主机名选择，再把实际连接固定到已验证 IP。仅能由 SOCKS5 代理解析的域名会被有意拒绝，因为该协议不会向 HubProxy 暴露实际目标 IP，无法完成这项 SSRF 校验。客户端断开时，上游请求和临时文件暂存会随请求上下文停止。每次请求使用的固定目标传输会在响应结束后关闭空闲连接。访问拒绝日志不记录直链查询字符串，避免把签名 URL 凭据写入日志。
+
+:::danger
+不要在公网实例上设置 `directLinkWhiteList = ["*/*"]`，除非你明确要提供开放下载代理。建议只允许所需域名或路径；若下载会跳转到 CDN，还需将跳转后的域名加入直链白名单。旧的 `whiteList = ["*/*"]` 不会启用通用直链。
+:::
 
 Release 等大文件支持 `wget -c` 断点续传，见 [传输特性](/guides/capabilities/)。
 
@@ -89,7 +107,15 @@ fileSize = 2147483648
 [access]
 whiteList = ["trusted-org/*"]
 blackList = ["*/malicious-repo"]
+directLinkWhiteList = ["ollama.com/download/*"]
+directLinkBlackList = []
 ```
+
+## 大文件下载与 IDM
+
+在服务端设置环境变量 `HUBPROXY_DOWNLOAD_USERNAME`、`HUBPROXY_DOWNLOAD_PASSWORD`，也可以在 `[downloadAuth]` 下设置 `username` 和 `password`，然后重启。请通过 HTTPS 访问。没有配置账号的实例只提供门槛以内的匿名下载。
+
+浏览器用户在本服务的 `/login` 登录后重新打开下载链接。IDM 用户可在 **下载 → 选项 → 站点登录 → 新建** 中保存 HubProxy 的 HTTPS 站点地址和同一组账号密码，再添加普通代理下载链接。每个连接都会独立认证。上游支持字节范围时，IDM 可以并行下载和断点续传。[IDM 官方说明](https://www.internetdownloadmanager.com/support/using_idm/options.html)
 
 ## 相关文档
 

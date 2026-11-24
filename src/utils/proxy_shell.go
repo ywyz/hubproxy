@@ -5,12 +5,16 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"net/netip"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
 // GitHub URL正则表达式
-var githubRegex = regexp.MustCompile(`(?:^|[\s'"(=,\[{;|&<>])https?://(?:github\.com|raw\.githubusercontent\.com|raw\.github\.com|gist\.githubusercontent\.com|gist\.github\.com|api\.github\.com)[^\s'")]*`)
+var githubRegex = regexp.MustCompile(`(?:^|[\s'"(=,\[{;|&<>])(https?://(?:github\.com|raw\.githubusercontent\.com|raw\.github\.com|gist\.githubusercontent\.com|gist\.github\.com|api\.github\.com)/[^\s'")]*)`)
+var shellHostLabel = regexp.MustCompile(`(?i)^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 // MaxShellSize 限制最大处理大小为 10MB
 const MaxShellSize = 10 * 1024 * 1024
@@ -30,9 +34,15 @@ func ProcessSmart(input io.Reader, isCompressed bool, host string) (io.Reader, i
 		return bytes.NewReader(content), int64(len(content)), nil
 	}
 
-	processed := processGitHubURLs(string(content), host)
-
-	return strings.NewReader(processed), int64(len(processed)), nil
+	origin, ok := shellProxyOrigin(host)
+	if !ok {
+		return nil, 0, fmt.Errorf("无效的脚本代理主机名")
+	}
+	processed, err := processGitHubURLs(content, origin)
+	if err != nil {
+		return nil, 0, err
+	}
+	return bytes.NewReader(processed), int64(len(processed)), nil
 }
 
 func readShellContent(input io.Reader, isCompressed bool) ([]byte, error) {
@@ -73,35 +83,82 @@ func readShellContent(input io.Reader, isCompressed bool) ([]byte, error) {
 	return data, nil
 }
 
-func processGitHubURLs(content, host string) string {
-	return githubRegex.ReplaceAllStringFunc(content, func(match string) string {
-		// 如果匹配包含前缀分隔符，保留它，防止出现重复转换
-		if len(match) > 0 && match[0] != 'h' {
-			prefix := match[0:1]
-			url := match[1:]
-			return prefix + transformURL(url, host)
+// Only a DNS name or IP literal and an optional numeric port may enter shell
+// source. URL authorities can otherwise contain characters significant to a shell.
+func shellProxyOrigin(raw string) (string, bool) {
+	if len(raw) == 0 || len(raw) > 280 {
+		return "", false
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" && u.Scheme != "http" || u.User != nil ||
+		u.Host == "" || u.Path != "" && u.Path != "/" || u.ForceQuery || u.RawQuery != "" || u.Fragment != "" {
+		return "", false
+	}
+	hostname := u.Hostname()
+	if addr, err := netip.ParseAddr(hostname); err == nil {
+		if addr.Zone() != "" {
+			return "", false
 		}
-		return transformURL(match, host)
-	})
+		hostname = addr.String()
+		if addr.Is6() {
+			hostname = "[" + hostname + "]"
+		}
+	} else {
+		domain := strings.TrimSuffix(hostname, ".")
+		if len(domain) > 253 {
+			return "", false
+		}
+		for _, label := range strings.Split(domain, ".") {
+			if !shellHostLabel.MatchString(label) {
+				return "", false
+			}
+		}
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || n == 0 {
+			return "", false
+		}
+		hostname += ":" + strconv.FormatUint(n, 10)
+	}
+	return u.Scheme + "://" + hostname, true
 }
 
-// transformURL URL转换函数
-func transformURL(url, host string) string {
-	if strings.Contains(url, host) {
-		return url
+func processGitHubURLs(content []byte, origin string) ([]byte, error) {
+	var out bytes.Buffer
+	size := len(content)
+	offset := 0
+	for {
+		match := githubRegex.FindSubmatchIndex(content[offset:])
+		if match == nil {
+			break
+		}
+		start, end := offset+match[2], offset+match[3]
+		target := content[start:end]
+		size += len(origin) + 1
+		upgrade := bytes.HasPrefix(target, []byte("http://"))
+		if upgrade {
+			size++
+		}
+		if size > MaxShellSize {
+			return nil, fmt.Errorf("改写后的脚本超过大小限制")
+		}
+		out.Write(content[offset:start])
+		out.WriteString(origin)
+		out.WriteByte('/')
+		if upgrade {
+			out.WriteString("https")
+			target = target[len("http"):]
+		}
+		out.Write(target)
+		offset = end
 	}
-
-	if strings.HasPrefix(url, "http://") {
-		url = "https" + url[4:]
-	} else if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "//") {
-		url = "https://" + url
+	if offset == 0 {
+		return content, nil
 	}
-
-	// 确保 host 有协议头
-	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
-		host = "https://" + host
-	}
-	host = strings.TrimSuffix(host, "/")
-
-	return host + "/" + url
+	out.Write(content[offset:])
+	return out.Bytes(), nil
 }

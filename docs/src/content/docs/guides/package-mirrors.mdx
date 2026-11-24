@@ -1,0 +1,91 @@
+---
+title: Linux 软件包镜像源
+description: 使用镜像自带的 Ubuntu、Debian、Omarchy、Arch、Alpine 和 Rocky Linux 软件包源，或添加其他 HTTPS 仓库。
+---
+
+软件包管理器可以把 `https://proxy.example.org/mirrors/<上游主机>/<仓库路径>` 用作仓库地址。HubProxy 按请求拉取数据库、包文件和签名，安装包仍由本机包管理器校验。加速效果取决于客户端到 HubProxy、HubProxy 到上游的两段网络。
+
+## Docker 镜像预置的仓库
+
+镜像内的 `/app/config.toml` 和仓库中的 `src/config.toml` 预置下表目录。将软件源基址开头的 `http://` 或 `https://` 换成 `https://proxy.example.org/mirrors/`，保留原来的仓库、发行版本、组件、架构和签名设置。HubProxy 通过 HTTPS 连接上游。
+
+| 发行版 | 可使用的上游主机和路径 | 官方资料 |
+| --- | --- | --- |
+| Ubuntu | `archive.ubuntu.com/ubuntu/`（主仓库）、`security.ubuntu.com/ubuntu/`（安全更新）、`ports.ubuntu.com/ubuntu-ports/`（含 arm64） | [Ubuntu 软件包管理](https://ubuntu.com/server/docs/how-to/software/package-management/) · [Ubuntu Ports](https://ports.ubuntu.com/ubuntu-ports/) |
+| Debian | `deb.debian.org/debian/`（主仓库）、`deb.debian.org/debian-security/` 或 `security.debian.org/debian-security/`（安全更新）。`cdn-fastly.deb.debian.org` 也允许这两个仓库目录 | [Debian 官方 CDN 端点](https://deb.debian.org/) |
+| Omarchy stable | `pkgs.omarchy.org/stable/x86_64/`，以及 `stable-mirror.omarchy.org` 上的 `core`、`extra`、`multilib` 仓库（x86_64） | [Omarchy stable mirrorlist](https://github.com/omacom/omarchy/blob/quattro/default/pacman/mirrorlist-stable) |
+| Arch Linux | `geo.mirror.pkgbuild.com/$repo/os/$arch`，适用于 x86_64 的 `core`、`extra`、`multilib` | [Arch 官方镜像记录](https://archlinux.org/mirrors/geo.mirror.pkgbuild.com/) |
+| Alpine | `dl-cdn.alpinelinux.org/alpine/` 下的 `v3.22`、`v3.23`、`v3.24` 和 `latest-stable`，各含 `main`、`community` | [Alpine 发行分支](https://alpinelinux.org/releases/) |
+| Rocky Linux | `dl.rockylinux.org/pub/rocky/` 下的 `9`、`10`，各含 `BaseOS`、`AppStream`、`extras` | [Rocky 官方仓库](https://dl.rockylinux.org/pub/rocky/) |
+
+例如，Ubuntu 的 deb822 软件源可将主仓库的 `URIs` 改为 `https://proxy.example.org/mirrors/archive.ubuntu.com/ubuntu`。Alpine 的 `/etc/apk/repositories` 可使用 `https://proxy.example.org/mirrors/dl-cdn.alpinelinux.org/alpine/v3.24/main`。Rocky 的 BaseOS 仓库可将对应的 `mirrorlist` 行替换为 `baseurl=https://proxy.example.org/mirrors/dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/`。
+
+自行挂载到 `/app/config.toml` 的文件会覆盖镜像配置。升级已有部署时，将所需规则合并到自己的 `[access].directLinkWhiteList` 并重启容器。此名单同时控制 `/mirrors/` 和通用 HTTPS 直链，省略或清空名单会使两个入口返回 403。
+
+## Omarchy stable（x86_64）
+
+Omarchy 自己发布的软件包来自 `pkgs.omarchy.org`，Arch 的 `core`、`extra`、`multilib` 仓库来自 `stable-mirror.omarchy.org`。以下示例覆盖这两个源。其他通道或架构请沿用本机已有的仓库主机和路径。[官方 pacman 配置](https://github.com/omacom/omarchy/blob/quattro/default/pacman/pacman-stable.conf) · [官方 mirrorlist](https://github.com/omacom/omarchy/blob/quattro/default/pacman/mirrorlist-stable)
+
+### 配置 HubProxy
+
+镜像的预置配置已包含这四个目录。若自定义部署只需 Omarchy stable，可使用以下名单。
+
+```toml
+[access]
+directLinkWhiteList = [
+    "pkgs.omarchy.org/stable/x86_64/*",
+    "stable-mirror.omarchy.org/core/os/x86_64/*",
+    "stable-mirror.omarchy.org/extra/os/x86_64/*",
+    "stable-mirror.omarchy.org/multilib/os/x86_64/*",
+]
+```
+
+### 配置 pacman
+
+把示例中的 `proxy.example.org` 换成你的 HubProxy 域名。在 `/etc/pacman.conf` 已有的 `[omarchy]` 段内替换 `Server` 行。
+
+```ini
+[omarchy]
+Server = https://proxy.example.org/mirrors/pkgs.omarchy.org/stable/$arch
+```
+
+在 `/etc/pacman.d/mirrorlist` 中，将下面一行放在原有 stable 镜像前面。pacman 会展开 `$repo` 和 `$arch`，在代理不可用时仍可尝试后面的官方地址。保留仓库顺序、签名策略和密钥环。[pacman 配置手册](https://man.archlinux.org/man/pacman.conf.5.en)
+
+```ini
+Server = https://proxy.example.org/mirrors/stable-mirror.omarchy.org/$repo/os/$arch
+```
+
+用以下命令检查两个仓库数据库，均应返回 HTTP 200。之后按原有流程从 Omarchy 菜单选择 **Update → Omarchy**。[Omarchy 更新指南](https://omarchy.org/manual/updates/)
+
+```bash
+curl -fsSI https://proxy.example.org/mirrors/pkgs.omarchy.org/stable/x86_64/omarchy.db
+curl -fsSI https://proxy.example.org/mirrors/stable-mirror.omarchy.org/core/os/x86_64/core.db
+```
+
+## 其他 HTTPS 仓库
+
+例如，现有仓库基址为 `https://repo.example.net/archlinux/$repo/os/$arch` 时，将 `repo.example.net/archlinux/*` 加入同一白名单，再使用以下地址。
+
+```ini
+Server = https://proxy.example.org/mirrors/repo.example.net/archlinux/$repo/os/$arch
+```
+
+仓库中的相对文件路径会沿用该前缀，包括 RPM 的 `repodata/repomd.xml`。仓库元数据若给出独立的绝对下载地址，包管理器会直接访问它。若源站通过 HTTP 重定向交付文件，还需将跳转目标加入直链白名单。镜像路由逐跳检查公网 HTTPS 目标，并原样传输仓库文件，包括脚本。
+
+## 自动下载需要登录的大包
+
+镜像支持 `GET`、`HEAD`、单区间 `Range` 和缓存验证头。文件超出匿名下载阈值（默认 2 GiB）时，代理返回 401。浏览器可以访问 `/login` 登录；pacman 运行在独立的进程中，可通过 HTTPS Basic 认证使用管理员配置的下载账户。
+
+如果 pacman 的源均使用 HTTPS，且需要无人值守下载大包，为执行下载的账户创建权限为 `0600` 的 `/etc/pacman.d/hubproxy.netrc`。只写代理主机的记录，用真实账户替换示例值。
+
+```text
+machine proxy.example.org
+login YOUR_DOWNLOAD_USER
+password YOUR_DOWNLOAD_PASSWORD
+```
+
+在 `/etc/pacman.conf` 已有的 `[options]` 段设置以下下载命令。此设置适用于该 pacman 实例的所有仓库，curl 只为匹配的主机读取凭据。[pacman 的 XferCommand](https://man.archlinux.org/man/pacman.conf.5.en) · [curl 的 netrc 选项](https://curl.se/docs/manpage.html#--netrc-file)
+
+```ini
+XferCommand = /usr/bin/curl --fail --location --proto =https --proto-redir =https --netrc-optional --netrc-file /etc/pacman.d/hubproxy.netrc --continue-at - --output %o %u
+```

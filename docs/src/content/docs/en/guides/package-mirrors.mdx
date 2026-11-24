@@ -1,0 +1,91 @@
+---
+title: Linux package mirrors
+description: Use the bundled Ubuntu, Debian, Omarchy, Arch, Alpine and Rocky Linux package repositories or add another HTTPS repository.
+---
+
+Package managers can use `https://proxy.example.org/mirrors/<upstream-host>/<repository-path>` as a repository URL. HubProxy fetches files on demand, while the package manager verifies signatures locally. Download speed depends on the network links from the client to HubProxy and from HubProxy to the origin.
+
+## Repositories bundled with the Docker image
+
+The image's `/app/config.toml` and the repository's `src/config.toml` allow the directories below. Replace the initial `http://` or `https://` in your repository base URL with `https://proxy.example.org/mirrors/`. Keep the existing release, components, architectures and signature settings. HubProxy connects to the upstream over HTTPS.
+
+| Distribution | Allowed upstream host and path | Official source |
+| --- | --- | --- |
+| Ubuntu | `archive.ubuntu.com/ubuntu/` for packages, `security.ubuntu.com/ubuntu/` for security updates, and `ports.ubuntu.com/ubuntu-ports/` for ports including arm64 | [Ubuntu package management](https://ubuntu.com/server/docs/how-to/software/package-management/) · [Ubuntu Ports](https://ports.ubuntu.com/ubuntu-ports/) |
+| Debian | `deb.debian.org/debian/` for packages, and `deb.debian.org/debian-security/` or `security.debian.org/debian-security/` for security updates. Both archive paths are also allowed on `cdn-fastly.deb.debian.org` | [Debian CDN endpoints](https://deb.debian.org/) |
+| Omarchy stable | `pkgs.omarchy.org/stable/x86_64/` and the x86_64 `core`, `extra` and `multilib` repositories on `stable-mirror.omarchy.org` | [Omarchy stable mirrorlist](https://github.com/omacom/omarchy/blob/quattro/default/pacman/mirrorlist-stable) |
+| Arch Linux | `geo.mirror.pkgbuild.com/$repo/os/$arch` for x86_64 `core`, `extra` and `multilib` | [Arch mirror entry](https://archlinux.org/mirrors/geo.mirror.pkgbuild.com/) |
+| Alpine | `main` and `community` for `v3.22`, `v3.23`, `v3.24` and `latest-stable` under `dl-cdn.alpinelinux.org/alpine/` | [Alpine release branches](https://alpinelinux.org/releases/) |
+| Rocky Linux | `BaseOS`, `AppStream` and `extras` for versions `9` and `10` under `dl.rockylinux.org/pub/rocky/` | [Rocky package repositories](https://dl.rockylinux.org/pub/rocky/) |
+
+For example, Ubuntu's deb822 main archive can use `URIs: https://proxy.example.org/mirrors/archive.ubuntu.com/ubuntu`. In Alpine's `/etc/apk/repositories`, a main repository entry can be `https://proxy.example.org/mirrors/dl-cdn.alpinelinux.org/alpine/v3.24/main`. For Rocky's BaseOS repository, replace its `mirrorlist` entry with `baseurl=https://proxy.example.org/mirrors/dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/`.
+
+Mounting your own file at `/app/config.toml` replaces the image configuration. When upgrading an existing deployment, merge the rules you need into its `[access].directLinkWhiteList` and restart the container. This list controls both `/mirrors/` and arbitrary HTTPS direct links. Omitting or emptying it makes both routes return 403.
+
+## Omarchy stable on x86_64
+
+Omarchy publishes its own packages at `pkgs.omarchy.org`. Its copies of Arch's `core`, `extra` and `multilib` repositories live at `stable-mirror.omarchy.org`. The example covers both origins. For another release channel or architecture, use the upstream hosts and paths already configured on that machine. [Official pacman configuration](https://github.com/omacom/omarchy/blob/quattro/default/pacman/pacman-stable.conf) · [Official mirrorlist](https://github.com/omacom/omarchy/blob/quattro/default/pacman/mirrorlist-stable)
+
+### Configure HubProxy
+
+The image already includes all four directories. To limit a custom installation to Omarchy stable, use the following allowlist.
+
+```toml
+[access]
+directLinkWhiteList = [
+    "pkgs.omarchy.org/stable/x86_64/*",
+    "stable-mirror.omarchy.org/core/os/x86_64/*",
+    "stable-mirror.omarchy.org/extra/os/x86_64/*",
+    "stable-mirror.omarchy.org/multilib/os/x86_64/*",
+]
+```
+
+### Configure pacman
+
+Replace `proxy.example.org` with your HubProxy hostname and edit the `Server` line in the existing `[omarchy]` section of `/etc/pacman.conf`.
+
+```ini
+[omarchy]
+Server = https://proxy.example.org/mirrors/pkgs.omarchy.org/stable/$arch
+```
+
+In `/etc/pacman.d/mirrorlist`, insert the following line before the original stable server. Pacman expands `$repo` and `$arch` and can try the next server if the proxy is unavailable. Keep the repository order, signature policy and keyrings. [pacman configuration manual](https://man.archlinux.org/man/pacman.conf.5.en)
+
+```ini
+Server = https://proxy.example.org/mirrors/stable-mirror.omarchy.org/$repo/os/$arch
+```
+
+Both database requests below should return HTTP 200. Continue using **Update → Omarchy** in the Omarchy menu for system upgrades. [Omarchy update guide](https://omarchy.org/manual/updates/)
+
+```bash
+curl -fsSI https://proxy.example.org/mirrors/pkgs.omarchy.org/stable/x86_64/omarchy.db
+curl -fsSI https://proxy.example.org/mirrors/stable-mirror.omarchy.org/core/os/x86_64/core.db
+```
+
+## Other HTTPS repositories
+
+For an existing repository at `https://repo.example.net/archlinux/$repo/os/$arch`, add `repo.example.net/archlinux/*` to the same allowlist and use the following address.
+
+```ini
+Server = https://proxy.example.org/mirrors/repo.example.net/archlinux/$repo/os/$arch
+```
+
+Relative paths, including RPM's `repodata/repomd.xml`, inherit the new base URL. If repository metadata contains an absolute download URL, the package manager will contact that URL directly. If the origin uses HTTP redirects, add each redirect destination to the direct-link allowlist. The mirror route checks for a public HTTPS destination on every hop and preserves repository file contents, including scripts.
+
+## Automatically download packages that require login
+
+The mirror supports `GET`, `HEAD`, single-range requests and cache validators. Files over the anonymous download threshold (2 GiB by default) return 401 to anonymous clients. Browser users can sign in at `/login`. Pacman runs separately from the browser and can use HTTPS Basic authentication with the download account configured by the administrator.
+
+For unattended downloads on a machine whose pacman repositories all use HTTPS, create `/etc/pacman.d/hubproxy.netrc` with mode `0600` and ownership assigned to the user running the downloader. Add a single entry for the proxy hostname and replace the placeholders with your download account.
+
+```text
+machine proxy.example.org
+login YOUR_DOWNLOAD_USER
+password YOUR_DOWNLOAD_PASSWORD
+```
+
+Set the following command in the existing `[options]` section of `/etc/pacman.conf`. This setting applies to all repositories in that pacman instance. Curl reads credentials for the matching host. [pacman's XferCommand](https://man.archlinux.org/man/pacman.conf.5.en) · [curl's netrc options](https://curl.se/docs/manpage.html#--netrc-file)
+
+```ini
+XferCommand = /usr/bin/curl --fail --location --proto =https --proto-redir =https --netrc-optional --netrc-file /etc/pacman.d/hubproxy.netrc --continue-at - --output %o %u
+```

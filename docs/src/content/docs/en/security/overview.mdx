@@ -11,9 +11,9 @@ HubProxy is an open proxy service — improper deployment creates abuse risk. Fo
 |-----------|-------------|
 | IP rate limiting | Per real client IP (IPv6 uses `/64`) |
 | IP allow/deny | `[security]` controls rate-limit exemption and blocking |
-| Repo access control | `[access]` restricts proxied images, GitHub repos, and Hugging Face resources |
+| Resource access control | `[access].whiteList` / `blackList` restrict repositories and images; independent `directLinkWhiteList` / `directLinkBlackList` rules restrict HTTPS direct links |
 | Trusted proxies | Forward headers trusted only from private/local networks |
-| File size limit | `[server].fileSize` prevents oversized file abuse |
+| Download authentication | Files larger than `[server].fileSize` require login, including range requests |
 | Offline download tokens | One-time tokens bound to IP and User-Agent, 2-minute TTL |
 
 ## Not Built In
@@ -22,17 +22,19 @@ HubProxy has **no** admin login, Basic Auth, API keys, or Prometheus `/metrics`.
 
 ## Main Risks
 
-1. **Open proxy**: Public `0.0.0.0:5000` without `[access].whiteList` lets anyone use your bandwidth
+1. **Open proxy**: Public `0.0.0.0:5000` without `[access].whiteList` allows any supported repository; setting `directLinkWhiteList = ["*/*"]` also opens arbitrary HTTPS direct links
 2. **IP spoofing**: Reverse proxy that appends instead of overwriting `X-Forwarded-For` bypasses rate limits
-3. **Host injection**: Missing `X-Forwarded-Host` causes incorrect URLs in rewritten `.sh` scripts
+3. **Host injection**: Missing `Host` causes incorrect URLs in rewritten `.sh` scripts
 
 ## Recommendations
 
 - Use [Recommended Architecture](/en/deployment/architecture/): CDN (optional) → reverse proxy → HubProxy
-- Configure `[access].whiteList` for public services
-- Overwrite `X-Forwarded-For`, `X-Real-IP`, and `X-Forwarded-Host` at the proxy
+- Configure `[access].whiteList` for repositories/images, and enable direct links only as needed with a narrowly scoped `[access].directLinkWhiteList`
+- Overwrite `X-Forwarded-For`, `X-Real-IP`, and `Host` at the proxy
 - Expose public services through a reverse proxy instead of port 5000 directly
-- Review `[access].blackList` and access logs regularly
+- Review `[access].blackList`, `[access].directLinkBlackList`, and access logs regularly
+
+Arbitrary direct links are deny-by-default: a missing or empty `directLinkWhiteList` denies all, and the legacy `whiteList` cannot authorize them. Only an explicit `"*/*"` permits every host and path.
 
 ## Related Docs
 

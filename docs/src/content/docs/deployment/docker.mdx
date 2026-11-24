@@ -6,20 +6,22 @@ description: 使用 Docker 与 Docker Compose 部署 HubProxy。
 ## docker run
 
 ```bash
+docker build -t hubproxy:local .
 docker run -d \
   --name hubproxy \
   -p 5000:5000 \
   --restart always \
-  -v ./src/config.toml:/app/config.toml:ro \
-  ghcr.io/sky22333/hubproxy
+  hubproxy:local
 ```
+
+镜像内置常见 Linux 软件包源的白名单。使用自定义配置时，可挂载 `./src/config.toml:/app/config.toml:ro`。配置大文件下载账号时，给 `docker run` 加上 `--env-file /path/to/hubproxy.env`，该文件只需保存 `HUBPROXY_DOWNLOAD_USERNAME` 和 `HUBPROXY_DOWNLOAD_PASSWORD`。
 
 ## Docker Compose
 
 项目根目录提供 `docker-compose.yml`：
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
 默认挂载 `./src/config.toml` 到容器内 `/app/config.toml`。Compose 文件内已配置日志轮转（`200m × 3`），无需在 `docker run` 中重复设置。

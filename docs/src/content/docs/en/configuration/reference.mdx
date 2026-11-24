@@ -11,9 +11,13 @@ Default config path is `./config.toml` in the working directory. Override with `
 |-----|------|---------|-------------|
 | `host` | string | `0.0.0.0` | Listen address |
 | `port` | int | `5000` | Listen port |
-| `fileSize` | int | `2147483648` | Max single-file size (bytes), GitHub / Hugging Face URL proxy only |
+| `fileSize` | int | `2147483648` | Maximum anonymous download size in bytes (up to 2 GiB). Authenticated downloads have no size cap. |
 | `enableH2C` | bool | `false` | Enable HTTP/2 Cleartext |
 | `enableFrontend` | bool | `true` | Enable web UI (Vue SPA) |
+
+## [downloadAuth]
+
+Set both `username` and `password` to enable a local download account. Both default to an empty string. With either value missing, downloads exceeding the anonymous threshold are unavailable. Choose a dedicated username that does not contain a colon. Browser sessions use an HTTPS-only cookie and expire after 24 hours or a service restart. IDM can save HTTP Basic credentials for the HubProxy HTTPS origin.
 
 ## [rateLimit]
 
@@ -43,11 +47,21 @@ Pulling one Docker image triggers multiple layer requests — each HTTP request 
 
 | Key | Description |
 |-----|-------------|
-| `whiteList` | Allowed repos/images (empty = no restriction) |
-| `blackList` | Blocked repos/images |
+| `whiteList` | Allowed repos/images (empty = no restriction; does not authorize direct links) |
+| `blackList` | Blocked repos/images (does not apply to direct links) |
+| `directLinkWhiteList` | Allowed HTTPS direct links and package repository paths. The bundled configuration includes [selected official Linux package repositories](../../guides/package-mirrors/). A missing or empty list denies all. |
+| `directLinkBlackList` | Blocked arbitrary HTTPS direct links |
 | `proxy` | Upstream SOCKS5 proxy, e.g. `socks5://127.0.0.1:1080` or `socks5://user:pass@host:1080` |
 
-Wildcards supported: `owner/*`, `*/repo-name`.
+Repository/image rules and direct-link rules use independent namespaces. Repository rules support wildcards such as `owner/*` and `*/repo-name`; direct-link rules match `{host}/{path-and-query}`, for example `downloads.example.com/releases/*`. Only `directLinkWhiteList = ["*/*"]` permits every host and path; do not use it on a public instance unless you intentionally operate an open download proxy.
+
+```toml
+[access]
+whiteList = ["trusted-org/*"]
+blackList = ["*/malicious-repo"]
+directLinkWhiteList = ["downloads.example.com/releases/*"]
+directLinkBlackList = ["downloads.example.com/releases/private/*"]
+```
 
 ## [download]
 

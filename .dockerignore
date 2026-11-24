@@ -1,0 +1,9 @@
+**
+!src/
+!src/**
+!web/
+!web/**
+**/node_modules
+**/dist
+**/.env
+**/.env.*

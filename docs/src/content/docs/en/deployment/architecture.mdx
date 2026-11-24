@@ -23,7 +23,7 @@ If you follow the recommended topology above (users → proxy → HubProxy):
 
 1. Reverse proxy must **overwrite** `X-Forwarded-For` / `X-Real-IP` (prevent client IP spoofing — never append client-supplied headers)
 2. **Preferably make port 5000 reachable only by the proxy** (bind `127.0.0.1` or firewall)
-3. Overwrite `X-Forwarded-Host` to prevent Host injection in `.sh` scripts
+3. Overwrite `Host` to prevent Host injection in `.sh` scripts
 
 ## Scenario Comparison
 

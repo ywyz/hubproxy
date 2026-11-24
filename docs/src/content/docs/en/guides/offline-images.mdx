@@ -106,3 +106,5 @@ maxImages = 10
 - Large images take longer; streamed downloads must restart if interrupted
 - Subject to `[access]` lists and IP rate limiting
 - Frontend static routes (`/`, `/images`, `/search`, `/assets/*`) are not rate-limited; `/ready`, API, and proxy requests all count
+
+Single and batch tar downloads use the same anonymous byte threshold as file downloads. When an archive exceeds it, sign in at `/login` and retry the prepared link within two minutes, or prepare a new link. Authenticated archives stream as they are built. Generated tar files have no byte-range resume support.

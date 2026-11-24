@@ -3,7 +3,7 @@ title: Environment Variables
 description: Environment variables supported by HubProxy.
 ---
 
-Environment variables override config after `config.toml` is loaded. Sections not listed here (e.g. `[registries]`, `[tokenCache]`, `[access].whiteList`) can only be changed in the config file.
+Environment variables override config after `config.toml` is loaded. Sections not listed here (e.g. `[registries]`, `[tokenCache]`, `[access].whiteList`, `[access].directLinkWhiteList`) can only be changed in the config file.
 
 ## All Variables
 
@@ -14,7 +14,9 @@ Environment variables override config after `config.toml` is loaded. Sections no
 | `SERVER_PORT` | `[server].port` | Listen port |
 | `ENABLE_H2C` | `[server].enableH2C` | Enable HTTP/2 Cleartext (`true`/`false`) |
 | `ENABLE_FRONTEND` | `[server].enableFrontend` | Enable web UI (`true`/`false`) |
-| `MAX_FILE_SIZE` | `[server].fileSize` | Max single-file size (bytes) |
+| `MAX_FILE_SIZE` | `[server].fileSize` | Anonymous download limit in bytes (up to 2 GiB) |
+| `HUBPROXY_DOWNLOAD_USERNAME` | `[downloadAuth].username` | Local download account |
+| `HUBPROXY_DOWNLOAD_PASSWORD` | `[downloadAuth].password` | Local download password |
 | `RATE_LIMIT` | `[rateLimit].requestLimit` | Requests per IP per period |
 | `RATE_PERIOD_HOURS` | `[rateLimit].periodHours` | Rate limit period (hours) |
 | `IP_WHITELIST` | `[security].whiteList` | Append rate-limit exempt IPs, comma-separated |
@@ -28,13 +30,15 @@ Environment variables override config after `config.toml` is loaded. Sections no
 # systemd / local
 CONFIG_PATH=/etc/hubproxy/config.toml ./hubproxy
 
-# Docker quick overrides
+# Build from the checkout root and set runtime overrides
+docker build -t hubproxy:local .
 docker run -d \
+  -p 5000:5000 \
   -e SERVER_PORT=5000 \
   -e RATE_LIMIT=1000 \
   -e IP_WHITELIST=10.0.0.0/8,192.168.1.100 \
-  -v ./config.toml:/app/config.toml:ro \
-  ghcr.io/sky22333/hubproxy
+  -v "$PWD/src/config.toml:/app/config.toml:ro" \
+  hubproxy:local
 ```
 
 ## Use Cases

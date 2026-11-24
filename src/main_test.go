@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -65,6 +66,31 @@ func TestReadyRoute(t *testing.T) {
 	}
 }
 
+func TestRouterAbortsInterruptedChunkedResponse(t *testing.T) {
+	router := newTestRouter(t, "")
+	router.GET("/test-interrupted", func(c *gin.Context) {
+		_, _ = io.WriteString(c.Writer, "prefix")
+		c.Writer.Flush()
+		panic(http.ErrAbortHandler)
+	})
+	for _, http2 := range []bool{false, true} {
+		server := httptest.NewUnstartedServer(router)
+		server.EnableHTTP2 = http2
+		server.StartTLS()
+		response, err := server.Client().Get(server.URL + "/test-interrupted")
+		if err != nil {
+			server.Close()
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		server.Close()
+		if readErr == nil || string(body) != "prefix" || (response.ProtoMajor == 2) != http2 {
+			t.Errorf("%s: body %q, read error %v", response.Proto, body, readErr)
+		}
+	}
+}
+
 func TestFrontendDisabledRoutesReturnNotFound(t *testing.T) {
 	router := newTestRouter(t, `
 [server]
@@ -76,6 +102,23 @@ enableFrontend = false
 		if w.Code != http.StatusNotFound {
 			t.Fatalf("%s status = %d, want 404", path, w.Code)
 		}
+	}
+}
+
+func TestDownloadLoginRouteWithoutSPA(t *testing.T) {
+	router := newTestRouter(t, `
+[server]
+enableFrontend = false
+[downloadAuth]
+username = "download-test"
+password = "fixture-only"
+`)
+	req := httptest.NewRequest(http.MethodGet, "https://hub.example/login", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Header().Get("Content-Type"), "text/html") ||
+		!strings.Contains(w.Body.String(), `type="password"`) {
+		t.Fatalf("download login form missing (status %d)", w.Code)
 	}
 }
 

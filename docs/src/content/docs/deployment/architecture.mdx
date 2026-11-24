@@ -23,7 +23,7 @@ description: 公网部署 HubProxy 的推荐拓扑与安全要求。
 
 1. **反代覆盖写** `X-Forwarded-For` / `X-Real-IP`（防止用户伪造 IP，勿 append 客户端自带头）
 2. **建议 5000 仅对反代可达**（绑定 `127.0.0.1` 或防火墙限制）
-3. 反代覆盖写 `X-Forwarded-Host`（防止 `.sh` 脚本 Host 注入）
+3. 反代覆盖写 `Host`（防止 `.sh` 脚本 Host 注入）
 
 ## 各场景对照
 

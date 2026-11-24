@@ -31,7 +31,7 @@ HubProxy 通过 go-containerregistry 向上游拉取 manifest 与 blob，再以 
 
 ## GitHub / Hugging Face 下载
 
-GitHub 代理（`proxyGitHubWithRedirect`）会将客户端**全部请求头**（含 `Range`）转发上游，并将上游**状态码与响应头**（含 `Content-Range`、`Accept-Ranges`）原样返回，再流式转发 body。
+HubProxy 转发 Range 及上游响应的分段信息，并在请求上游前移除本地登录凭据。
 
 | 能力 | 支持 | 说明 |
 |------|------|------|
@@ -40,8 +40,8 @@ GitHub 代理（`proxyGitHubWithRedirect`）会将客户端**全部请求头**�
 | 多连接 Range 分片 | ✅ | aria2 等多线程分片下载可用（依赖上游支持 Range） |
 | 重定向跟随 | ✅ | 最多 20 次；GitHub URL 的 Location 自动改写 |
 | 网页类型拦截 | ✅ | `text/html` 等返回 403 |
-| 文件大小限制 | ✅ | `[server].fileSize`，默认 2GB（按响应头 `Content-Length` 校验） |
-| `.sh` / `.ps1` 脚本改写 | ⚠️ | 脚本会完整下载并改写内容后 chunked 输出，**不支持** Range 续传 |
+| 大文件下载 | ✅ | 超过 `[server].fileSize`（最高 2 GiB）需要登录；已登录下载不限大小。 |
+| `.sh` / `.ps1` | ✅ | 小脚本的匿名完整下载可改写 GitHub 地址。登录下载、Range 分段和软件包镜像返回原始字节。 |
 
 ### wget 断点续传示例
 
@@ -50,7 +50,6 @@ GitHub 代理（`proxyGitHubWithRedirect`）会将客户端**全部请求头**�
 wget -c "https://example.com/https://github.com/owner/repo/releases/download/v1.0.0/large.bin"
 ```
 
-实现位置：`src/handlers/github.go` 第 113–118 行（转发请求头）、第 209–231 行（透传响应）。
 
 ## 离线镜像 tar
 
@@ -65,4 +64,5 @@ wget -c "https://example.com/https://github.com/owner/repo/releases/download/v1.
 
 - [Docker 镜像加速](/guides/docker-mirror/)
 - [GitHub 加速](/guides/github-proxy/)
+- [Omarchy 与其他软件包镜像源](/guides/package-mirrors/)
 - [离线镜像包](/guides/offline-images/)

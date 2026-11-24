@@ -19,6 +19,12 @@ type RegistryMapping struct {
 	Enabled  bool   `toml:"enabled"`
 }
 
+// DownloadAuthConfig 本地下载登录配置
+type DownloadAuthConfig struct {
+	Username string `toml:"username"`
+	Password string `toml:"password"`
+}
+
 // AppConfig 应用配置结构体
 type AppConfig struct {
 	Server struct {
@@ -40,14 +46,18 @@ type AppConfig struct {
 	} `toml:"security"`
 
 	Access struct {
-		WhiteList []string `toml:"whiteList"`
-		BlackList []string `toml:"blackList"`
-		Proxy     string   `toml:"proxy"`
+		WhiteList           []string `toml:"whiteList"`
+		BlackList           []string `toml:"blackList"`
+		DirectLinkWhiteList []string `toml:"directLinkWhiteList"`
+		DirectLinkBlackList []string `toml:"directLinkBlackList"`
+		Proxy               string   `toml:"proxy"`
 	} `toml:"access"`
 
 	Download struct {
 		MaxImages int `toml:"maxImages"`
 	} `toml:"download"`
+
+	DownloadAuth DownloadAuthConfig `toml:"downloadAuth"`
 
 	Registries map[string]RegistryMapping `toml:"registries"`
 
@@ -98,13 +108,17 @@ func DefaultConfig() *AppConfig {
 			BlackList: []string{},
 		},
 		Access: struct {
-			WhiteList []string `toml:"whiteList"`
-			BlackList []string `toml:"blackList"`
-			Proxy     string   `toml:"proxy"`
+			WhiteList           []string `toml:"whiteList"`
+			BlackList           []string `toml:"blackList"`
+			DirectLinkWhiteList []string `toml:"directLinkWhiteList"`
+			DirectLinkBlackList []string `toml:"directLinkBlackList"`
+			Proxy               string   `toml:"proxy"`
 		}{
-			WhiteList: []string{},
-			BlackList: []string{},
-			Proxy:     "",
+			WhiteList:           []string{},
+			BlackList:           []string{},
+			DirectLinkWhiteList: []string{},
+			DirectLinkBlackList: []string{},
+			Proxy:               "",
 		},
 		Download: struct {
 			MaxImages int `toml:"maxImages"`
@@ -178,6 +192,8 @@ func GetConfig() *AppConfig {
 	configCopy.Security.BlackList = append([]string(nil), appConfig.Security.BlackList...)
 	configCopy.Access.WhiteList = append([]string(nil), appConfig.Access.WhiteList...)
 	configCopy.Access.BlackList = append([]string(nil), appConfig.Access.BlackList...)
+	configCopy.Access.DirectLinkWhiteList = append([]string(nil), appConfig.Access.DirectLinkWhiteList...)
+	configCopy.Access.DirectLinkBlackList = append([]string(nil), appConfig.Access.DirectLinkBlackList...)
 	appConfigLock.RUnlock()
 
 	cachedConfig = &configCopy
@@ -217,6 +233,9 @@ func LoadConfig() error {
 	}
 
 	overrideFromEnv(cfg)
+	if strings.Contains(cfg.DownloadAuth.Username, ":") {
+		return fmt.Errorf("下载账户用户名不能包含 HTTP Basic 分隔符冒号")
+	}
 	setConfig(cfg)
 
 	return nil
@@ -274,5 +293,12 @@ func overrideFromEnv(cfg *AppConfig) {
 		if maxImages, err := strconv.Atoi(val); err == nil && maxImages > 0 {
 			cfg.Download.MaxImages = maxImages
 		}
+	}
+
+	if val, ok := os.LookupEnv("HUBPROXY_DOWNLOAD_USERNAME"); ok {
+		cfg.DownloadAuth.Username = val
+	}
+	if val, ok := os.LookupEnv("HUBPROXY_DOWNLOAD_PASSWORD"); ok {
+		cfg.DownloadAuth.Password = val
 	}
 }

@@ -18,9 +18,9 @@ Strongly recommended. It provides TLS, correct client IP passing, and avoids exp
 </details>
 
 <details>
-<summary>What's the difference between rate-limit and registry whitelists?</summary>
+<summary>What's the difference between rate-limit, repository, and direct-link allowlists?</summary>
 
-`[security].whiteList` exempts IPs from rate limiting. `[access].whiteList` controls which Docker images, GitHub repos, and Hugging Face resources can be proxied. They are independent.
+`[security].whiteList` exempts IPs from rate limiting. `[access].whiteList` controls which Docker images, GitHub repos, and Hugging Face resources can be proxied. `[access].directLinkWhiteList` separately controls arbitrary HTTPS direct links and denies them when missing or empty. All three lists are independent.
 
 </details>
 

@@ -7,22 +7,25 @@ HubProxy 提供 Docker 镜像与系统安装包两种主流部署方式。
 
 ## Docker 部署（推荐）
 
+在当前分支的仓库根目录运行以下命令。
+
 ```bash
+docker build -t hubproxy:local .
 docker run -d \
   --name hubproxy \
   -p 5000:5000 \
   --restart always \
-  -v /path/to/config.toml:/app/config.toml:ro \
-  ghcr.io/sky22333/hubproxy
+  -v "$PWD/src/config.toml:/app/config.toml:ro" \
+  hubproxy:local
 ```
 
 :::tip
 使用 [Docker Compose](/deployment/docker/) 可更方便地挂载配置文件；日志轮转已在 Compose 文件中预置。
 :::
 
-## 脚本安装
+## 安装上游系统发行包
 
-自动识别系统与架构，从 GitHub Releases 下载 `.deb`、`.rpm` 或 `.apk`：
+以下脚本根据系统与架构从 `sky22333/hubproxy` 的 GitHub Releases 下载 `.deb`、`.rpm` 或 `.apk`。要使用本分支的软件包镜像和大文件登录功能，请按上面的步骤构建 Docker 镜像。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sky22333/hubproxy/main/install.sh | sh

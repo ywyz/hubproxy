@@ -11,9 +11,13 @@ description: HubProxy 配置文件完整参考。
 |----|------|--------|------|
 | `host` | string | `0.0.0.0` | 监听地址 |
 | `port` | int | `5000` | 监听端口 |
-| `fileSize` | int | `2147483648` | 单文件大小上限（字节），仅影响 GitHub / Hugging Face URL 代理 |
+| `fileSize` | int | `2147483648` | 匿名下载门槛（字节），最高 2 GiB。已登录下载不限文件大小。 |
 | `enableH2C` | bool | `false` | 启用 HTTP/2 Cleartext |
 | `enableFrontend` | bool | `true` | 启用 Web 界面（Vue SPA） |
+
+## [downloadAuth]
+
+`username` 和 `password` 默认均为空。两项都配置后才可登录，缺少任意一项时，超过匿名门槛的下载会被拒绝。请为代理选择独立的用户名，避免与上游账号重名，用户名中不要使用冒号。浏览器会话通过 HTTPS Cookie 保存，24 小时后或服务重启后失效；IDM 可以为 HubProxy 的 HTTPS 域名保存站点登录凭据。
 
 ## [rateLimit]
 
@@ -43,11 +47,21 @@ Docker 拉取一个镜像会请求多个 layer，每个 HTTP 请求均消耗限�
 
 | 键 | 说明 |
 |----|------|
-| `whiteList` | 允许代理的仓库/镜像（空=不限制） |
-| `blackList` | 禁止代理的仓库/镜像 |
+| `whiteList` | 允许代理的仓库/镜像（空=不限制；不授权通用直链） |
+| `blackList` | 禁止代理的仓库/镜像（不作用于通用直链） |
+| `directLinkWhiteList` | 允许代理的通用 HTTPS 直链和软件源目录。随附配置包含[部分 Linux 官方软件源](../../guides/package-mirrors/)，省略或清空名单会拒绝全部。 |
+| `directLinkBlackList` | 禁止代理的通用 HTTPS 直链 |
 | `proxy` | 上游 SOCKS5 代理，如 `socks5://127.0.0.1:1080` 或 `socks5://user:pass@host:1080` |
 
-仓库规则支持通配符，如 `owner/*`、`*/repo-name`。
+仓库/镜像规则与直链规则是两个独立命名空间。仓库规则支持 `owner/*`、`*/repo-name` 等通配符；直链规则按 `{域名}/{路径和查询}` 匹配，例如 `downloads.example.com/releases/*`。仅 `directLinkWhiteList = ["*/*"]` 会允许任意域名和路径；请勿在公网实例上使用，除非你明确要提供开放下载代理。
+
+```toml
+[access]
+whiteList = ["trusted-org/*"]
+blackList = ["*/malicious-repo"]
+directLinkWhiteList = ["downloads.example.com/releases/*"]
+directLinkBlackList = ["downloads.example.com/releases/private/*"]
+```
 
 ## [download]
 

@@ -1,8 +1,13 @@
 package utils
 
 import (
+	"net"
+	"net/netip"
+	"net/url"
+	"strconv"
 	"strings"
 
+	"golang.org/x/net/idna"
 	"hubproxy/config"
 )
 
@@ -115,6 +120,96 @@ func (ac *AccessController) CheckGitHubAccess(matches []string) (allowed bool, r
 	}
 
 	return true, ""
+}
+
+// CheckDirectLinkAccess 检查通用直链访问权限。主机名不区分大小写，路径和查询保持大小写敏感。
+func (ac *AccessController) CheckDirectLinkAccess(matches []string) (allowed bool, reason string) {
+	if len(matches) < 2 {
+		return false, "无效的通用直链格式"
+	}
+
+	cfg := config.GetConfig()
+	if len(cfg.Access.DirectLinkWhiteList) == 0 || !ac.checkDirectLinkList(matches[0], matches[1], cfg.Access.DirectLinkWhiteList) {
+		return false, "不在通用直链白名单内"
+	}
+	if len(cfg.Access.DirectLinkBlackList) > 0 && ac.checkDirectLinkList(matches[0], matches[1], cfg.Access.DirectLinkBlackList) {
+		return false, "通用直链在黑名单内"
+	}
+	return true, ""
+}
+
+func (ac *AccessController) checkDirectLinkList(host, pathAndQuery string, list []string) bool {
+	host, validHost := canonicalDirectLinkListAuthority(strings.TrimSpace(host))
+	if !validHost || pathAndQuery == "" {
+		return false
+	}
+
+	for _, item := range list {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		patternHost, patternPath, hasPath := strings.Cut(item, "/")
+		if patternHost == "*" && (!hasPath || patternPath == "") {
+			continue
+		}
+		if patternHost != "*" {
+			canonicalPatternHost, validPatternHost := canonicalDirectLinkListAuthority(patternHost)
+			if !validPatternHost || canonicalPatternHost != host {
+				continue
+			}
+		}
+		if !hasPath || patternPath == "" || patternPath == "*" {
+			return true
+		}
+		if pathAndQuery == patternPath {
+			return true
+		}
+		if strings.HasSuffix(patternPath, "*") && strings.HasPrefix(pathAndQuery, strings.TrimSuffix(patternPath, "*")) {
+			return true
+		}
+		if strings.HasPrefix(pathAndQuery, patternPath+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func canonicalDirectLinkListAuthority(authority string) (string, bool) {
+	parsed, err := url.Parse("https://" + authority)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false
+	}
+	hostname := strings.TrimSuffix(parsed.Hostname(), ".")
+	if hostname == "" || strings.Contains(hostname, "%") {
+		return "", false
+	}
+	if address, err := netip.ParseAddr(hostname); err == nil {
+		address = address.Unmap()
+		hostname = address.String()
+		if address.Is6() {
+			hostname = "[" + hostname + "]"
+		}
+	} else {
+		asciiHostname, err := idna.Lookup.ToASCII(hostname)
+		if err != nil {
+			return "", false
+		}
+		hostname = strings.ToLower(asciiHostname)
+	}
+
+	port := parsed.Port()
+	if port == "" {
+		return hostname, true
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", false
+	}
+	if portNumber == 443 {
+		return hostname, true
+	}
+	return net.JoinHostPort(strings.Trim(hostname, "[]"), strconv.Itoa(portNumber)), true
 }
 
 // matchImageInList 检查Docker镜像是否在指定列表中

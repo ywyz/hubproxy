@@ -3,7 +3,7 @@ title: 环境变量
 description: HubProxy 支持的环境变量说明。
 ---
 
-环境变量在加载 `config.toml` 之后覆盖对应配置项。未列出的配置段（如 `[registries]`、`[tokenCache]`、`[access].whiteList`）只能通过配置文件修改。
+环境变量在加载 `config.toml` 之后覆盖对应配置项。未列出的配置段（如 `[registries]`、`[tokenCache]`、`[access].whiteList`、`[access].directLinkWhiteList`）只能通过配置文件修改。
 
 ## 全部变量
 
@@ -14,7 +14,9 @@ description: HubProxy 支持的环境变量说明。
 | `SERVER_PORT` | `[server].port` | 监听端口 |
 | `ENABLE_H2C` | `[server].enableH2C` | 启用 HTTP/2 Cleartext（`true`/`false`） |
 | `ENABLE_FRONTEND` | `[server].enableFrontend` | 启用 Web 界面（`true`/`false`） |
-| `MAX_FILE_SIZE` | `[server].fileSize` | 单文件大小上限（字节） |
+| `MAX_FILE_SIZE` | `[server].fileSize` | 匿名下载门槛（字节），最高 2 GiB |
+| `HUBPROXY_DOWNLOAD_USERNAME` | `[downloadAuth].username` | 本地下载账号 |
+| `HUBPROXY_DOWNLOAD_PASSWORD` | `[downloadAuth].password` | 本地下载密码 |
 | `RATE_LIMIT` | `[rateLimit].requestLimit` | 每 IP 每周期请求数 |
 | `RATE_PERIOD_HOURS` | `[rateLimit].periodHours` | 限流周期（小时） |
 | `IP_WHITELIST` | `[security].whiteList` | 追加限流豁免 IP，逗号分隔 |
@@ -28,13 +30,15 @@ description: HubProxy 支持的环境变量说明。
 # systemd / 本地运行
 CONFIG_PATH=/etc/hubproxy/config.toml ./hubproxy
 
-# Docker 快速调参
+# 在当前仓库根目录构建镜像并设置运行参数
+docker build -t hubproxy:local .
 docker run -d \
+  -p 5000:5000 \
   -e SERVER_PORT=5000 \
   -e RATE_LIMIT=1000 \
   -e IP_WHITELIST=10.0.0.0/8,192.168.1.100 \
-  -v ./config.toml:/app/config.toml:ro \
-  ghcr.io/sky22333/hubproxy
+  -v "$PWD/src/config.toml:/app/config.toml:ro" \
+  hubproxy:local
 ```
 
 ## 使用场景

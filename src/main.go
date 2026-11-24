@@ -89,18 +89,33 @@ func registerFrontendRoutes(router *gin.Engine, enabled bool) {
 
 func buildRouter(cfg *config.AppConfig) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
-	router := gin.Default()
+	router := gin.New()
+	router.Use(gin.Logger())
 	utils.ConfigureTrustedProxies(router)
 
-	router.Use(gin.CustomRecovery(func(c *gin.Context, recovered interface{}) {
-		log.Printf("Panic 已恢复: %v", recovered)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Internal server error",
-			"code":  "INTERNAL_ERROR",
-		})
-	}))
+	router.Use(func(c *gin.Context) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				// Let net/http terminate interrupted streams without a clean EOF.
+				if recovered == http.ErrAbortHandler {
+					panic(http.ErrAbortHandler)
+				}
+				log.Printf("Panic 已恢复: %v", recovered)
+				if c.Writer.Written() {
+					panic(http.ErrAbortHandler)
+				}
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+					"error": "Internal server error",
+					"code":  "INTERNAL_ERROR",
+				})
+			}
+		}()
+		c.Next()
+	})
 
 	router.Use(utils.RateLimitMiddleware(globalLimiter))
+
+	handlers.RegisterDownloadAuth(router, cfg.DownloadAuth)
 
 	initHealthRoutes(router)
 	handlers.InitImageTarRoutes(router)
