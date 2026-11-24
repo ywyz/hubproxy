@@ -1,59 +1,123 @@
-﻿---
+---
 title: Docker 部署
-description: 使用 Docker 与 Docker Compose 部署 HubProxy。
+description: 从源码运行 HubProxy，或构建、部署和回滚经过验证的版本镜像。
 ---
 
-## docker run
+## 本地从源码运行
 
-```bash
-docker build -t hubproxy:local .
-docker run -d \
-  --name hubproxy \
-  -p 5000:5000 \
-  --restart always \
-  hubproxy:local
-```
-
-镜像内置常见 Linux 软件包源的白名单。使用自定义配置时，可挂载 `./src/config.toml:/app/config.toml:ro`。配置大文件下载账号时，给 `docker run` 加上 `--env-file /path/to/hubproxy.env`，该文件只需保存 `HUBPROXY_DOWNLOAD_USERNAME` 和 `HUBPROXY_DOWNLOAD_PASSWORD`。
-
-## Docker Compose
-
-项目根目录提供 `docker-compose.yml`：
+在仓库根目录使用项目自带的 `docker-compose.yml`。它会构建 `hubproxy:local`，发布宿主机端口 `5000`，并将 `./src/config.toml` 只读挂载到 `/app/config.toml`。
 
 ```bash
 docker compose up -d --build
+curl -fsS --retry 5 --retry-connrefused --retry-delay 1 http://127.0.0.1:5000/ready
 ```
 
-默认挂载 `./src/config.toml` 到容器内 `/app/config.toml`。Compose 文件内已配置日志轮转（`200m × 3`），无需在 `docker run` 中重复设置。
-
-:::caution
-生产环境建议不要将 `5000` 直接映射到公网。更安全的做法是让 Caddy/Nginx 容器访问 HubProxy 内网地址。
-:::
-
-## 与反代配合
-
-典型 Compose 结构：
-
-```
-caddy:    对外 443，反代 hubproxy:5000
-hubproxy: 仅内网暴露 5000，不映射到宿主机公网
-```
-
-## 健康检查
-
-容器镜像未内置 `HEALTHCHECK`，可手动验证：
+单独使用 Docker 时，可以只监听回环地址，并使用镜像内置的配置和软件包镜像源白名单。
 
 ```bash
-curl http://127.0.0.1:5000/ready
+docker build -t hubproxy:local .
+docker run -d --name hubproxy -p 127.0.0.1:5000:5000 --restart unless-stopped hubproxy:local
 ```
 
-## Compose 日志（可选）
+## 构建并传输发布镜像
 
-若使用 Compose，可在 `docker-compose.yml` 中配置：
+以下 Bash 命令适用于接收预构建镜像的部署主机。在构建机上从已审阅、已合并的 `main` 开始，使用 Node.js 24、Go 1.26 和 Docker Buildx。示例为 `linux/amd64` 构建镜像。其他架构请同时调整构建平台、归档名和主机上的架构检查。将示例 SSH 目标换成可以管理 Docker 并写入部署目录的账号。
 
-| 参数 | 含义 |
-|------|------|
-| `max-size=200m` | 单个日志文件上限 |
-| `max-file=3` | 保留 3 个文件，总量约 600MB |
+```bash
+set -euo pipefail
+git switch main
+git pull --ff-only origin main
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+test -z "$(git status --porcelain)"
+(cd web && npm ci && npm run build)
+(cd src && go test ./...)
 
-`docker run` 未指定时 Docker 默认约 20MB 日志上限。
+revision=$(git rev-parse HEAD)
+version=git-${revision:0:12}
+docker buildx build --platform linux/amd64 --load \
+  --build-arg "VERSION=$version" \
+  --label "org.opencontainers.image.revision=$revision" \
+  -t "hubproxy:$version" .
+
+out=$(mktemp -d)
+archive=hubproxy-$version-linux-amd64.tar.gz
+docker image save "hubproxy:$version" | gzip -1 > "$out/$archive"
+(cd "$out" && sha256sum "$archive" > "$archive.sha256")
+
+target=deploy@host.example.com
+ssh "$target" 'mkdir -p /opt/hubproxy'
+scp "$out/$archive" "$out/$archive.sha256" "$target:/opt/hubproxy/"
+scp deploy/compose.yaml "$target:/opt/hubproxy/compose.yaml.candidate"
+printf 'version=%s\n' "$version"
+```
+
+最后一行输出的版本号同时用于镜像标签和 `/ready` 响应。保留本次和上次成功发布的镜像、归档与校验文件，以便回滚。
+
+## 首次准备部署主机
+
+在主机上运行以下命令。仓库中的 `deploy/compose.yaml` 是发布用模板，使用本地已加载的镜像，并为容器配置健康检查和日志轮转。它将服务发布到 `127.0.0.1:15001`。如果已有部署，先备份 Compose 文件和挂载的配置，对照 `compose.yaml.candidate` 合并变更，保留项目名、服务名、挂载和运行环境。首次迁移时，把当前镜像的完整引用写为 `release.env` 的 `HUBPROXY_IMAGE`，并记下当前 `/ready` 返回的版本。若使用 `latest` 等可变标签，先为运行中的镜像 ID 打上专用回滚标签，再记录这个标签。
+
+```bash
+cd /opt/hubproxy
+umask 077
+if [[ ! -e compose.yaml && ! -e compose.yml && ! -e docker-compose.yaml && ! -e docker-compose.yml ]]; then
+  install -m 600 compose.yaml.candidate compose.yaml
+fi
+touch runtime.env
+chmod 600 runtime.env
+```
+
+把大文件下载账号的 `HUBPROXY_DOWNLOAD_USERNAME` 和 `HUBPROXY_DOWNLOAD_PASSWORD` 放在 `runtime.env` 中。无需登录时文件可为空。如果已有专用凭据文件，可以将 Compose 的 `env_file` 指向原文件。如果使用自定义配置，请启用模板中挂载到 `/app/config.toml` 的只读卷，并保留主机配置文件。`release.env` 只保存镜像引用。更新镜像时沿用这些运行配置。
+
+让宿主机上的 Caddy 或 Nginx 将公网 HTTPS 域名转发到 `127.0.0.1:15001`，并按反向代理指南设置客户端 IP 请求头。[反向代理配置](/deployment/reverse-proxy/)
+
+## 上线并验证
+
+在主机上，把示例 `version` 替换为构建机输出的版本号。先校验归档和镜像信息。切换镜像时，命令会备份上一个不同的 `release.env`，重复部署同一版本会保留该备份。
+
+```bash
+set -euo pipefail
+cd /opt/hubproxy
+version=git-0123456789ab
+unset HUBPROXY_IMAGE
+archive=hubproxy-$version-linux-amd64.tar.gz
+sha256sum --check "$archive.sha256"
+docker image load -i "$archive"
+test "$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "hubproxy:$version")" = linux/amd64
+revision=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "hubproxy:$version")
+test "git-${revision:0:12}" = "$version"
+
+printf 'HUBPROXY_IMAGE=hubproxy:%s\n' "$version" > release.next.env
+docker compose --env-file release.next.env config --quiet
+test "$(docker compose --env-file release.next.env config --images hubproxy)" = "hubproxy:$version"
+if [ -f release.env ] && ! cmp -s release.env release.next.env; then
+  cp -p release.env release.previous.env
+fi
+mv release.next.env release.env
+docker compose --env-file release.env up -d --wait --wait-timeout 90 hubproxy
+```
+
+将 `public` 换成服务的公网域名。在主机上用 `curl` 和 `jq` 核对回环地址、公网地址的就绪状态和版本，再通过公网代理读取 Ubuntu 的签名索引头。如果部署使用自定义白名单，请换成已放行的仓库文件并检查其内容。
+
+```bash
+public=https://proxy.example.com
+for base in http://127.0.0.1:15001 "$public"; do
+  curl -fsS --max-time 15 "$base/ready" |
+    jq -e --arg v "$version" '.ready == true and .version == $v'
+done
+curl -fsS --max-time 60 "$public/mirrors/archive.ubuntu.com/ubuntu/dists/noble/InRelease" |
+  grep -F -- '-----BEGIN PGP SIGNED MESSAGE-----'
+```
+
+## 回滚
+
+升级或验证失败时，使用上一次的镜像引用重建服务。以下命令适用于已有 `release.previous.env` 的部署。核对 `/ready` 的版本与升级前的记录，并用旧版支持的下载路径复测。若同时修改过宿主机配置，先恢复与旧版匹配的备份。
+
+```bash
+cd /opt/hubproxy
+cp -p release.previous.env release.rollback.env
+unset HUBPROXY_IMAGE
+mv release.rollback.env release.env
+docker compose --env-file release.env up -d --wait --wait-timeout 90 hubproxy
+curl -fsS http://127.0.0.1:15001/ready | jq '{ready,version}'
+```

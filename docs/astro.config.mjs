@@ -2,7 +2,7 @@ import { defineConfig } from 'astro/config'
 import starlight from '@astrojs/starlight'
 
 export default defineConfig({
-  site: 'https://docs.52013120.xyz',
+  site: process.env.DOCS_SITE || undefined,
   base: '/',
   integrations: [
     starlight({
@@ -27,11 +27,11 @@ export default defineConfig({
         {
           icon: 'github',
           label: 'GitHub',
-          href: 'https://github.com/sky22333/hubproxy',
+          href: 'https://github.com/ywyz/hubproxy',
         },
       ],
       editLink: {
-        baseUrl: 'https://github.com/sky22333/hubproxy/edit/main/docs/',
+        baseUrl: 'https://github.com/ywyz/hubproxy/edit/main/docs/',
       },
       sidebar: [
         {

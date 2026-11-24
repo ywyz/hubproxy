@@ -5,6 +5,8 @@ description: 配置 Caddy 与 Nginx 反向代理，正确传递客户端真实 I
 
 反向代理必须**覆盖写入**真实客户端 IP，HubProxy 才能按用户独立限流并防止 IP 伪造。
 
+下列示例使用根目录 Compose 的宿主机端口 `5000`。若按[生产部署指南](/deployment/docker/)使用 `deploy/compose.yaml`，请将示例中的 `127.0.0.1:5000` 换成 `127.0.0.1:15001`。
+
 ## Caddy
 
 ### 基础反代

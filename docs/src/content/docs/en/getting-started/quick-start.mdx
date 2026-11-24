@@ -1,63 +1,36 @@
 ﻿---
 title: Quick Start
-description: Run HubProxy in minutes with Docker or the install script.
+description: Build the main branch of ywyz/hubproxy with Git and Docker Compose and verify the running service.
 ---
 
-HubProxy supports Docker images and native package installation.
+## Run from source
 
-## Docker (Recommended)
-
-Run these commands from the root of your checkout.
+With Git, Docker, and Docker Compose installed, run the following commands from the directory where you keep your source checkouts.
 
 ```bash
-docker build -t hubproxy:local .
-docker run -d \
-  --name hubproxy \
-  -p 5000:5000 \
-  --restart always \
-  -v "$PWD/src/config.toml:/app/config.toml:ro" \
-  hubproxy:local
+git clone --branch main https://github.com/ywyz/hubproxy.git
+cd hubproxy
+docker compose up -d --build
 ```
 
-:::tip
-[Docker Compose](/en/deployment/docker/) makes config mounting easier; log rotation is preconfigured in Compose.
-:::
+The included Compose file builds the `hubproxy:local` image, publishes the service on host port `5000`, and mounts `src/config.toml` read-only. The default configuration enables the web interface and common Linux package repositories.
 
-## Install an Upstream Release
-
-The script detects the OS and architecture and downloads a `.deb`, `.rpm`, or `.apk` from `sky22333/hubproxy` releases. To use this branch's package mirrors and large-download login, build the Docker image above.
+## Verify the service
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sky22333/hubproxy/main/install.sh | sh
+curl -fsS http://127.0.0.1:5000/ready
 ```
 
-The service starts automatically. Config is at `/etc/hubproxy/config.toml`.
-
-## Verify
+A ready service returns HTTP 200 and a JSON object containing `"ready":true` and `"service":"hubproxy"`. You can now open the [local web interface](http://127.0.0.1:5000/). To check an upstream request, fetch the headers for a file in the bundled Debian repository.
 
 ```bash
-curl http://127.0.0.1:5000/ready   # Local health check
+curl -fsSI http://127.0.0.1:5000/mirrors/deb.debian.org/debian/dists/stable/InRelease
 ```
 
-Expected response:
+Expect HTTP 200. If the request fails, run `docker compose logs --tail=50 hubproxy` from the checkout to inspect the service logs.
 
-```json
-{
-  "ready": true,
-  "service": "hubproxy",
-  "version": "v1.x.x",
-  "start_time_unix": 1710000000,
-  "uptime_sec": 42.5,
-  "uptime_human": "42s"
-}
-```
+## Configure your deployment
 
-## Next Steps
-
-- [System Installation](/en/getting-started/install/)
-- [Docker Compose](/en/deployment/docker/)
-- [Docker Mirror Guide](/en/guides/docker-mirror/)
-
-## Production recommendation
-
-After verification, set up a **custom domain + reverse proxy + HTTPS** (Caddy / Nginx) so clients use `https://example.com` instead of bare `http://IP:5000`. See [Recommended Architecture](/en/deployment/architecture/) and [Reverse Proxy](/en/deployment/reverse-proxy/).
+- **Large downloads.** The default anonymous limit is 2 GiB per file. For larger downloads, set both `HUBPROXY_DOWNLOAD_USERNAME` and `HUBPROXY_DOWNLOAD_PASSWORD`, then run `docker compose up -d` to apply them. Browser users can sign in at `/login`. [Transfer capabilities](../../guides/capabilities/) · [Configuration reference](../../configuration/reference/)
+- **HTTPS and mirror sources.** For public access, configure TLS with Caddy or Nginx. Edit `src/config.toml` to change which package repositories the proxy accepts. [Docker deployment](../../deployment/docker/) · [Reverse proxy](../../deployment/reverse-proxy/) · [Package mirrors](../../guides/package-mirrors/)
+- **Upstream system packages.** By default, the install script downloads the `.deb`, `.rpm`, or `.apk` published by `sky22333/hubproxy`. Build from the checkout above to deploy the features documented for this fork. [System installation](../install/)

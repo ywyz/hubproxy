@@ -1,49 +1,44 @@
 ﻿---
 title: HubProxy 文档
-description: Docker 与 GitHub 加速代理服务的官方文档，涵盖部署、配置与安全实践。
+description: 从源码部署 ywyz/hubproxy，代理 Docker 镜像、仓库文件、HTTPS 直链和 Linux 软件包下载。
 template: splash
 hero:
-  tagline: 轻量级、自托管的多功能加速代理
+  tagline: 自托管 Docker 镜像、仓库文件与 Linux 软件包下载代理
   image:
     file: ../../assets/hero.svg
   actions:
-    - text: 快速开始
-      link: /getting-started/quick-start/
+    - text: 从源码启动
+      link: ./getting-started/quick-start/
       icon: right-arrow
-    - text: GitHub
-      link: https://github.com/sky22333/hubproxy
+    - text: ywyz/hubproxy 源码
+      link: https://github.com/ywyz/hubproxy
       icon: external
       variant: minimal
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components'
 
-## 核心能力
+本手册适用于 `ywyz/hubproxy` 的 `main` 分支。这个 fork 在上游的容器镜像和仓库文件代理基础上，增加了按白名单开放的 HTTPS 直链、Linux 软件包镜像入口和大文件下载登录。
 
-<CardGrid stagger>
-  <Card title="Docker 镜像加速" icon="rocket">
-    支持 Docker Hub、GHCR、Quay、GCR、registry.k8s.io 等 Registry API v2 标准仓库。
+## 下载方式
+
+<CardGrid>
+  <Card title="Docker 镜像" icon="seti:docker">
+    从 Docker Hub、GHCR、Quay 等仓库拉取镜像，也可以在网页中搜索镜像、浏览标签并下载离线 tar 包。[Docker 镜像加速](./guides/docker-mirror/) · [离线镜像包](./guides/offline-images/)
   </Card>
-  <Card title="GitHub 文件加速" icon="document">
-    在完整 URL 前加域名即可加速 Release、Raw、Clone、API 与 Hugging Face 下载。
+  <Card title="GitHub 与 Hugging Face" icon="document">
+    在原始 URL 前加上 HubProxy 地址，即可下载 Release 附件、Raw 文件和模型文件。支持的 Git 操作和 URL 格式见 [仓库文件代理指南](./guides/github-proxy/)。
   </Card>
-  <Card title="离线镜像包" icon="seti:docker">
-    在线打包镜像为 tar，支持单镜像与批量下载。
+  <Card title="Linux 软件包与 HTTPS 直链" icon="rocket">
+    通过 `/mirrors/` 将软件包管理器连接到允许的上游，也可以按域名和路径开放其他 HTTPS 文件。仓库附带常用 Linux 软件源的白名单。[软件包镜像配置](./guides/package-mirrors/)
   </Card>
-  <Card title="镜像搜索" icon="magnifier">
-    内置 Docker Hub 镜像搜索与标签浏览。
-  </Card>
-  <Card title="智能限流" icon="warning">
-    按真实客户端 IP 限流，支持黑白名单与仓库访问控制。
-  </Card>
-  <Card title="完全自托管" icon="approve-check">
-    单二进制部署，不依赖第三方免费 CDN 代理服务。
+  <Card title="大文件下载" icon="approve-check">
+    管理员配置本地下载账号后，浏览器用户可在 `/login` 登录，命令行客户端可使用 HTTP Basic 认证，下载超过匿名大小限制的文件。[传输特性与限制](./guides/capabilities/)
   </Card>
 </CardGrid>
 
-## 推荐阅读
+## 部署与配置
 
-- 公网部署请优先阅读 [推荐部署架构](/deployment/architecture/) 与 [反向代理配置](/deployment/reverse-proxy/)
-- K8s / NAS 用户见 [Kubernetes 与 containerd](/guides/kubernetes-containerd/)、[NAS 配置](/guides/nas/)
-- 能力边界见 [传输特性](/guides/capabilities/)，扩展开发见 [二次开发与构建](/guides/development/)
-- 配置项说明见 [config.toml 参考](/configuration/reference/)
+- 首次运行请从源码构建并检查服务状态。[快速开始](./getting-started/quick-start/)
+- 调整端口、挂载配置或通过 HTTPS 对外提供服务。[Docker 部署](./deployment/docker/) · [反向代理](./deployment/reverse-proxy/)
+- 设置下载大小、白名单和 IP 限流。[配置参考](./configuration/reference/)

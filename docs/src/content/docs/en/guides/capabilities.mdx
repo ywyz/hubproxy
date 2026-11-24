@@ -1,9 +1,24 @@
 ---
 title: Transfer Capabilities
-description: Transfer behavior for Docker pulls and GitHub downloads in HubProxy.
+description: Compare the upstream project and this fork, including direct downloads, Linux package mirrors, download accounts and configuration migration.
 ---
 
-Based on current code in `src/handlers/docker.go` and `src/handlers/github.go`.
+## What changed in this fork
+
+Both versions support Docker Registry pulls and image search, offline image tar archives, GitHub Releases, Raw files, Git operations and Hugging Face downloads. This comparison covers [upstream sky22333/hubproxy at `77ece22`](https://github.com/sky22333/hubproxy/tree/77ece220eed26a2be12b03cf5f46173156ac55fb) and [this fork, ywyz/hubproxy at `687d926`](https://github.com/ywyz/hubproxy/tree/687d92634a3089cf77e497f002ed5c2b7aceed34).
+
+| Use case | Upstream | This fork |
+| --- | --- | --- |
+| Third-party software downloads | The file proxy recognizes predefined GitHub and Hugging Face URL patterns. | Other public HTTPS files can be allowlisted. For example, a vendor release at `https://downloads.example.org/releases/v1.2.3/app.zip` is available through `/https://downloads.example.org/releases/v1.2.3/app.zip`. The route accepts GET, HEAD and single byte ranges. |
+| Linux package repositories | No dedicated package mirror route. | A package manager can use `/mirrors/<upstream-host>/<repository-path>` as its repository base. The image allowlists selected Ubuntu, Debian, Omarchy stable, Arch, Alpine and Rocky repository directories. This route preserves file bytes so the package manager can verify signatures. |
+| Download size | GitHub and Hugging Face responses whose declared length exceeds `[server].fileSize` return 413. | This setting controls the anonymous size limit, with a default and maximum of 2 GiB. It applies to each file, registry blob or offline tar archive. Larger transfers return 401 until the client signs in with a local download account. Authenticated transfers have no size cap. Range requests are checked against the whole file size. |
+| Redirects and outbound proxies | File downloads use a shared HTTP client. | Cross-origin repository redirects drop source credentials. Direct links and mirrors check access rules on every hop. For connections pinned to a validated IP, proxy selection uses the original hostname. With an HTTPS proxy, HubProxy verifies the proxy certificate first, then verifies the download hostname inside the CONNECT tunnel. |
+
+### Migrating from upstream
+
+1. Deploy the fork's code or image. Its Compose file builds `hubproxy:local` and mounts `./src/config.toml` from the host at `/app/config.toml`. An existing mount replaces the configuration bundled in the image.
+2. Keep `[access].whiteList` and `blackList` for repositories and images. In the same section, add the direct-download and package paths you use, including required CDN redirects, to `directLinkWhiteList`. Use `directLinkBlackList` to exclude individual paths. If the direct-link allowlist is absent or empty, both generic direct downloads and package mirrors return 403. [Package mirror list and examples](/en/guides/package-mirrors/)
+3. To allow downloads above the anonymous limit, set both `[downloadAuth].username` and `password`, or set `HUBPROXY_DOWNLOAD_USERNAME` and `HUBPROXY_DOWNLOAD_PASSWORD`, then restart. Browser users sign in at `/login` over HTTPS. CLI clients and IDM can send HTTP Basic credentials to the HubProxy host. Repository access rules still apply to the local download account. [Download client setup](/en/guides/github-proxy/)
 
 ## Docker Image Pulls
 
@@ -16,12 +31,14 @@ HubProxy fetches manifests and blobs via go-containerregistry, then returns them
 | Multi-registry paths | ✅ | e.g. `example.com/ghcr.io/owner/image:tag` |
 | containerd `ns` param | ✅ | Matches `[registries]` entries |
 | Auth realm rewrite | ✅ | Upstream token → HubProxy `/token` |
-| HTTP Range / in-layer resume | ❌ | Blobs always fetched fully; client `Range` ignored |
+| HTTP Range / in-layer resume | ❌ | Each GET serves the whole layer. An interrupted layer must be requested again. |
 | Layer-level retry | ✅ | Docker/containerd retries failed layers |
 
 :::note
 Each layer costs at least one blob request against rate limits. No Range inside a layer, but clients may pull **different layers** in parallel.
 :::
+
+HubProxy streams blobs with a known length. For anonymous downloads with an unknown length, it checks the size in a temporary file before sending the response.
 
 ## GitHub / Hugging Face Downloads
 
@@ -48,7 +65,7 @@ wget -c "https://example.com/https://github.com/owner/repo/releases/download/v1.
 
 | Capability | Supported |
 |------------|-----------|
-| Streaming tar | ✅ |
+| Streaming tar | Signed-in clients receive the archive as it is built. Anonymous archives are staged and size-checked before delivery. |
 | One-time token (2 min) | ✅ |
 | Range / resume | ❌ |
 | `Cache-Control: no-store` | ✅ |
