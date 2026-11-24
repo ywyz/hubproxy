@@ -19,6 +19,12 @@ type RegistryMapping struct {
 	Enabled  bool   `toml:"enabled"`
 }
 
+// DownloadAuthConfig 本地下载登录配置
+type DownloadAuthConfig struct {
+	Username string `toml:"username"`
+	Password string `toml:"password"`
+}
+
 // AppConfig 应用配置结构体
 type AppConfig struct {
 	Server struct {
@@ -50,6 +56,8 @@ type AppConfig struct {
 	Download struct {
 		MaxImages int `toml:"maxImages"`
 	} `toml:"download"`
+
+	DownloadAuth DownloadAuthConfig `toml:"downloadAuth"`
 
 	Registries map[string]RegistryMapping `toml:"registries"`
 
@@ -225,6 +233,9 @@ func LoadConfig() error {
 	}
 
 	overrideFromEnv(cfg)
+	if strings.Contains(cfg.DownloadAuth.Username, ":") {
+		return fmt.Errorf("下载账户用户名不能包含 HTTP Basic 分隔符冒号")
+	}
 	setConfig(cfg)
 
 	return nil
@@ -282,5 +293,12 @@ func overrideFromEnv(cfg *AppConfig) {
 		if maxImages, err := strconv.Atoi(val); err == nil && maxImages > 0 {
 			cfg.Download.MaxImages = maxImages
 		}
+	}
+
+	if val, ok := os.LookupEnv("HUBPROXY_DOWNLOAD_USERNAME"); ok {
+		cfg.DownloadAuth.Username = val
+	}
+	if val, ok := os.LookupEnv("HUBPROXY_DOWNLOAD_PASSWORD"); ok {
+		cfg.DownloadAuth.Password = val
 	}
 }

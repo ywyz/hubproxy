@@ -14,7 +14,9 @@ description: HubProxy 支持的环境变量说明。
 | `SERVER_PORT` | `[server].port` | 监听端口 |
 | `ENABLE_H2C` | `[server].enableH2C` | 启用 HTTP/2 Cleartext（`true`/`false`） |
 | `ENABLE_FRONTEND` | `[server].enableFrontend` | 启用 Web 界面（`true`/`false`） |
-| `MAX_FILE_SIZE` | `[server].fileSize` | 单文件大小上限（字节） |
+| `MAX_FILE_SIZE` | `[server].fileSize` | 匿名下载门槛（字节），最高 2 GiB |
+| `HUBPROXY_DOWNLOAD_USERNAME` | `[downloadAuth].username` | 本地下载账号 |
+| `HUBPROXY_DOWNLOAD_PASSWORD` | `[downloadAuth].password` | 本地下载密码 |
 | `RATE_LIMIT` | `[rateLimit].requestLimit` | 每 IP 每周期请求数 |
 | `RATE_PERIOD_HOURS` | `[rateLimit].periodHours` | 限流周期（小时） |
 | `IP_WHITELIST` | `[security].whiteList` | 追加限流豁免 IP，逗号分隔 |

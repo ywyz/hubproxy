@@ -14,7 +14,9 @@ Environment variables override config after `config.toml` is loaded. Sections no
 | `SERVER_PORT` | `[server].port` | Listen port |
 | `ENABLE_H2C` | `[server].enableH2C` | Enable HTTP/2 Cleartext (`true`/`false`) |
 | `ENABLE_FRONTEND` | `[server].enableFrontend` | Enable web UI (`true`/`false`) |
-| `MAX_FILE_SIZE` | `[server].fileSize` | Max single-file size (bytes) |
+| `MAX_FILE_SIZE` | `[server].fileSize` | Anonymous download limit in bytes (up to 2 GiB) |
+| `HUBPROXY_DOWNLOAD_USERNAME` | `[downloadAuth].username` | Local download account |
+| `HUBPROXY_DOWNLOAD_PASSWORD` | `[downloadAuth].password` | Local download password |
 | `RATE_LIMIT` | `[rateLimit].requestLimit` | Requests per IP per period |
 | `RATE_PERIOD_HOURS` | `[rateLimit].periodHours` | Rate limit period (hours) |
 | `IP_WHITELIST` | `[security].whiteList` | Append rate-limit exempt IPs, comma-separated |

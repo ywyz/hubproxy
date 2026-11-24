@@ -2,16 +2,20 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"hubproxy/config"
 	"hubproxy/utils"
 )
@@ -135,7 +139,7 @@ func handleRegistryRequest(c *gin.Context, path string) {
 	case "manifests":
 		handleManifestRequest(c, imageRef, reference)
 	case "blobs":
-		handleBlobRequest(c, imageRef, reference)
+		handleBlobRequest(c, imageRef, reference, dockerProxy.options)
 	case "tags":
 		handleTagsRequest(c, imageRef)
 	default:
@@ -235,8 +239,49 @@ func handleManifestRequest(c *gin.Context, imageRef, reference string) {
 	}
 }
 
-// handleBlobRequest 处理blob请求
-func handleBlobRequest(c *gin.Context, imageRef, digest string) {
+// remote.Layer verifies the compressed digest, but exposes GET's body and
+// only HEAD's metadata. Record the length of the actual GET, including a
+// redirect to a registry CDN. Other requests, such as token exchanges and
+// registry pings, must not supply a length for the blob.
+type blobLengthTransport struct {
+	http.RoundTripper
+	host, path string
+	length     atomic.Int64
+}
+
+func (t *blobLengthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.RoundTripper.RoundTrip(req)
+	if err == nil && req.Method == http.MethodGet && resp.StatusCode == http.StatusOK {
+		original := req
+		for original.Response != nil && original.Response.Request != nil {
+			original = original.Response.Request
+		}
+		if original.URL.Host == t.host && original.URL.Path == t.path {
+			t.length.Store(resp.ContentLength)
+		}
+	}
+	return resp, err
+}
+
+func writeRegistryBlobError(c *gin.Context, err error) {
+	status := http.StatusBadGateway
+	var upstream *transport.Error
+	if errors.As(err, &upstream) && upstream.StatusCode >= 400 && upstream.StatusCode <= 599 {
+		status = upstream.StatusCode
+		// Blob fetches authenticate to the registry as HubProxy's upstream
+		// identity. The client's download password cannot satisfy that challenge.
+		if status == http.StatusUnauthorized {
+			status = http.StatusForbidden
+		}
+	}
+	c.String(status, "Registry blob: %s", http.StatusText(status))
+}
+
+func handleBlobRequest(c *gin.Context, imageRef, digest string, options []remote.Option) {
+	authenticated := DownloadAuthenticated(c)
+	if authenticated {
+		c.Header("Cache-Control", "private, no-store")
+	}
 	digestRef, err := name.NewDigest(fmt.Sprintf("%s@%s", imageRef, digest))
 	if err != nil {
 		fmt.Printf("解析digest引用失败: %v\n", err)
@@ -244,36 +289,103 @@ func handleBlobRequest(c *gin.Context, imageRef, digest string) {
 		return
 	}
 
-	layer, err := remote.Layer(digestRef, dockerProxy.options...)
+	repo := digestRef.Context()
+	blobTransport := &blobLengthTransport{
+		RoundTripper: utils.GetGlobalHTTPClient().Transport,
+		host:         repo.RegistryStr(),
+		path:         "/v2/" + repo.RepositoryStr() + "/blobs/" + digest,
+	}
+	blobTransport.length.Store(-1)
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
+	options = append(options[:len(options):len(options)], remote.WithTransport(blobTransport), remote.WithContext(ctx))
+	layer, err := remote.Layer(digestRef, options...)
 	if err != nil {
-		fmt.Printf("获取layer失败: %v\n", err)
-		c.String(http.StatusNotFound, "Layer not found")
+		writeRegistryBlobError(c, err)
 		return
 	}
-
-	size, err := layer.Size()
-	if err != nil {
-		fmt.Printf("获取layer大小失败: %v\n", err)
-		c.String(http.StatusInternalServerError, "Failed to get layer size")
+	var size int64
+	var body io.Reader
+	if c.Request.Method == http.MethodHead {
+		size, err = layer.Size()
+		if err != nil {
+			writeRegistryBlobError(c, err)
+			return
+		}
+	} else {
+		reader, err := layer.Compressed()
+		if err != nil {
+			writeRegistryBlobError(c, err)
+			return
+		}
+		stream := newDirectLinkIdleReadCloser(reader, directLinkBodyIdleTimeout, cancel)
+		defer stream.Close()
+		body = stream
+		size = blobTransport.length.Load()
+		if !authenticated && size < 0 {
+			staged, err := stageAnonymousDownload(func(w *directLinkQuotaWriter) error {
+				_, err := io.Copy(w, io.LimitReader(stream, anonymousDownloadLimit()+1))
+				return err
+			})
+			if err != nil {
+				if stream.timedOut.Load() {
+					c.String(http.StatusGatewayTimeout, "Registry blob timed out")
+				} else if !handleDownloadStageError(c, err) {
+					writeRegistryBlobError(c, err)
+				}
+				return
+			}
+			defer staged.cleanup()
+			body, size = staged, staged.size
+		}
+	}
+	if !authenticated && size > anonymousDownloadLimit() {
+		RequireDownloadLogin(c)
 		return
 	}
-
-	reader, err := layer.Compressed()
-	if err != nil {
-		fmt.Printf("获取layer内容失败: %v\n", err)
-		c.String(http.StatusInternalServerError, "Failed to get layer content")
-		return
-	}
-	defer reader.Close()
-
 	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Length", fmt.Sprintf("%d", size))
 	c.Header("Docker-Content-Digest", digest)
-
-	c.Status(http.StatusOK)
-	if _, err := io.Copy(c.Writer, reader); err != nil {
-		fmt.Printf("复制layer内容失败: %v\n", err)
+	if size >= 0 {
+		c.Header("Content-Length", fmt.Sprint(size))
 	}
+	c.Status(http.StatusOK)
+	if body != nil {
+		if err := copyVerifiedBlob(c.Writer, body, size); err != nil {
+			log.Printf("复制镜像层失败: %v", err)
+			if c.Writer.Written() {
+				panic(http.ErrAbortHandler)
+			}
+			removeResponseEntityHeaders(c.Writer.Header())
+			c.Header("Docker-Content-Digest", "")
+			writeRegistryBlobError(c, err)
+		}
+	}
+}
+
+func copyVerifiedBlob(w http.ResponseWriter, body io.Reader, size int64) error {
+	if size <= 0 {
+		_, err := copyDownloadResponse(w, body)
+		return err
+	}
+	// remote.Layer verifies the digest at EOF. Once Content-Length bytes
+	// reach a client, even closing the connection cannot signal a bad digest.
+	// Hold just the last byte until verification has finished.
+	n, err := copyDownloadResponse(w, io.LimitReader(body, size-1))
+	if err != nil {
+		return err
+	}
+	if n != size-1 {
+		return io.ErrUnexpectedEOF
+	}
+	tail, err := io.ReadAll(io.LimitReader(body, 2))
+	if err != nil {
+		return err
+	}
+	if len(tail) != 1 {
+		return fmt.Errorf("unexpected blob length")
+	}
+	_, err = downloadResponseWriter(w).Write(tail)
+	return err
 }
 
 // handleTagsRequest 处理tags列表请求
@@ -485,7 +597,7 @@ func handleMultiRegistryRequest(c *gin.Context, registryDomain, remainingPath st
 	case "manifests":
 		handleUpstreamManifestRequest(c, upstreamImageRef, reference, mapping)
 	case "blobs":
-		handleUpstreamBlobRequest(c, upstreamImageRef, reference, mapping)
+		handleBlobRequest(c, upstreamImageRef, reference, createUpstreamOptions(mapping))
 	case "tags":
 		handleUpstreamTagsRequest(c, upstreamImageRef, mapping)
 	default:
@@ -558,48 +670,6 @@ func handleUpstreamManifestRequest(c *gin.Context, imageRef, reference string, m
 		}
 
 		c.Data(http.StatusOK, string(desc.MediaType), desc.Manifest)
-	}
-}
-
-// handleUpstreamBlobRequest 处理上游Registry的blob请求
-func handleUpstreamBlobRequest(c *gin.Context, imageRef, digest string, mapping config.RegistryMapping) {
-	digestRef, err := name.NewDigest(fmt.Sprintf("%s@%s", imageRef, digest))
-	if err != nil {
-		fmt.Printf("解析digest引用失败: %v\n", err)
-		c.String(http.StatusBadRequest, "Invalid digest reference")
-		return
-	}
-
-	options := createUpstreamOptions(mapping)
-	layer, err := remote.Layer(digestRef, options...)
-	if err != nil {
-		fmt.Printf("获取layer失败: %v\n", err)
-		c.String(http.StatusNotFound, "Layer not found")
-		return
-	}
-
-	size, err := layer.Size()
-	if err != nil {
-		fmt.Printf("获取layer大小失败: %v\n", err)
-		c.String(http.StatusInternalServerError, "Failed to get layer size")
-		return
-	}
-
-	reader, err := layer.Compressed()
-	if err != nil {
-		fmt.Printf("获取layer内容失败: %v\n", err)
-		c.String(http.StatusInternalServerError, "Failed to get layer content")
-		return
-	}
-	defer reader.Close()
-
-	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Length", fmt.Sprintf("%d", size))
-	c.Header("Docker-Content-Digest", digest)
-
-	c.Status(http.StatusOK)
-	if _, err := io.Copy(c.Writer, reader); err != nil {
-		fmt.Printf("复制layer内容失败: %v\n", err)
 	}
 }
 

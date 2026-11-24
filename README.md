@@ -74,6 +74,12 @@ git clone https://yourdomain.com/https://github.com/sky22333/hubproxy.git
 
 > **直链默认关闭**：任意 HTTPS 直链必须通过 `[access].directLinkWhiteList` 显式启用；缺失或空数组都会拒绝直链，只有 `"*/*"` 才会全量放行。
 
+### 大文件与软件包镜像
+
+默认单文件不超过 2 GiB 可匿名下载。要开放更大的文件，请在服务环境设置 `HUBPROXY_DOWNLOAD_USERNAME` 和 `HUBPROXY_DOWNLOAD_PASSWORD` 并重启。浏览器在 `/login` 登录，IDM 可在“选项 → 站点登录”中保存 HubProxy 的 HTTPS 地址及账号。服务端按完整文件大小鉴权，登录后不设大小上限。使用方法见[大文件与 IDM 指南](docs/src/content/docs/guides/github-proxy.mdx)。
+
+Omarchy 和其他 HTTPS 软件包源使用 `/mirrors/<上游主机>/<原路径>`。管理员先将上游加入直链白名单，用户再替换包管理器中的源地址。完整的 pacman 配置见[软件包镜像指南](docs/src/content/docs/guides/package-mirrors.mdx)。
+
 ## 详细文档
 
 部署架构、完整配置、K8s / NAS、传输特性与 FAQ 见官方文档站：

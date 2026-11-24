@@ -11,9 +11,13 @@ Default config path is `./config.toml` in the working directory. Override with `
 |-----|------|---------|-------------|
 | `host` | string | `0.0.0.0` | Listen address |
 | `port` | int | `5000` | Listen port |
-| `fileSize` | int | `2147483648` | Max single-file size (bytes) for GitHub, Hugging Face, and arbitrary HTTPS direct-link proxying |
+| `fileSize` | int | `2147483648` | Maximum anonymous download size in bytes (up to 2 GiB). Authenticated downloads have no size cap. |
 | `enableH2C` | bool | `false` | Enable HTTP/2 Cleartext |
 | `enableFrontend` | bool | `true` | Enable web UI (Vue SPA) |
+
+## [downloadAuth]
+
+Set both `username` and `password` to enable a local download account. Both default to an empty string. With either value missing, downloads exceeding the anonymous threshold are unavailable. Choose a dedicated username that does not contain a colon. Browser sessions use an HTTPS-only cookie and expire after 24 hours or a service restart. IDM can save HTTP Basic credentials for the HubProxy HTTPS origin.
 
 ## [rateLimit]
 

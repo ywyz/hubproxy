@@ -39,6 +39,7 @@ func newGitHubProxyTestRouter(t *testing.T, configBody string) *gin.Engine {
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
+	RegisterDownloadAuth(router, config.GetConfig().DownloadAuth)
 	router.NoRoute(GitHubProxyHandler)
 	return router
 }
@@ -69,23 +70,7 @@ func performGitHubProxyRequestWithBody(router http.Handler, method, target, body
 
 func configureDirectLinkTestUpstream(t *testing.T, upstream *httptest.Server, hostname string) string {
 	t.Helper()
-
-	previousLookup := lookupDirectLinkIPs
-	lookupDirectLinkIPs = func(_ context.Context, _, host string) ([]netip.Addr, error) {
-		if strings.EqualFold(host, hostname) {
-			return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
-		}
-		return previousLookup(context.Background(), "ip", host)
-	}
-	t.Cleanup(func() { lookupDirectLinkIPs = previousLookup })
-
-	transport := upstream.Client().Transport.(*http.Transport).Clone()
-	transport.TLSClientConfig.InsecureSkipVerify = true // Test-only host mapping to httptest TLS.
-	upstreamAddress := upstream.Listener.Addr().String()
-	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, network, upstreamAddress)
-	}
-	utils.GetGlobalHTTPClient().Transport = transport
+	routeGlobalHTTPClientToTestUpstream(t, upstream, hostname)
 
 	parsed, err := url.Parse(upstream.URL)
 	if err != nil {
@@ -94,8 +79,18 @@ func configureDirectLinkTestUpstream(t *testing.T, upstream *httptest.Server, ho
 	return "https://" + net.JoinHostPort(hostname, parsed.Port())
 }
 
-func routeGlobalHTTPClientToTestUpstream(t *testing.T, upstream *httptest.Server) {
+func routeGlobalHTTPClientToTestUpstream(t *testing.T, upstream *httptest.Server, publicHosts ...string) {
 	t.Helper()
+	previousLookup := lookupDirectLinkIPs
+	lookupDirectLinkIPs = func(_ context.Context, _, host string) ([]netip.Addr, error) {
+		for _, known := range publicHosts {
+			if strings.EqualFold(host, known) {
+				return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+			}
+		}
+		return nil, fmt.Errorf("no DNS fixture for %s", host)
+	}
+	t.Cleanup(func() { lookupDirectLinkIPs = previousLookup })
 
 	transport := upstream.Client().Transport.(*http.Transport).Clone()
 	transport.TLSClientConfig.InsecureSkipVerify = true // Test-only host mapping to httptest TLS.
@@ -117,7 +112,7 @@ func configureMultiAddressDirectLinkTestUpstream(t *testing.T, upstream *httptes
 				netip.MustParseAddr("1.0.0.1"),
 			}, nil
 		}
-		return previousLookup(context.Background(), "ip", host)
+		return nil, fmt.Errorf("no DNS fixture for %s", host)
 	}
 	t.Cleanup(func() { lookupDirectLinkIPs = previousLookup })
 
@@ -395,7 +390,7 @@ func TestDirectLinkRejectsPrivateTargetAddresses(t *testing.T) {
 	}
 }
 
-func TestDirectLinkBodyLimitReturns413BeforeStreaming(t *testing.T) {
+func TestDirectLinkBodyLimitChallengesBeforeStreaming(t *testing.T) {
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.WriteHeader(http.StatusOK)
@@ -408,11 +403,11 @@ func TestDirectLinkBodyLimitReturns413BeforeStreaming(t *testing.T) {
 	upstreamURL := configureDirectLinkTestUpstream(t, upstream, "downloads.example.com")
 
 	recorder := performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/chunked.bin", nil)
-	if recorder.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413; body=%q", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%q", recorder.Code, recorder.Body.String())
 	}
 	if strings.Contains(recorder.Body.String(), "1234") {
-		t.Fatalf("upstream prefix was streamed before the 413 response: %q", recorder.Body.String())
+		t.Fatalf("upstream prefix was streamed before the 401 response: %q", recorder.Body.String())
 	}
 }
 
@@ -433,16 +428,16 @@ func TestDirectLinkBodyLimitUsesCompleteContentRangeSize(t *testing.T) {
 	headers := http.Header{"Range": {"bytes=0-3"}}
 
 	recorder := performGitHubProxyRequest(router, http.MethodGet, upstreamURL+"/large.bin", headers)
-	if recorder.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status = %d, want 413; body=%q", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%q", recorder.Code, recorder.Body.String())
 	}
 	if strings.Contains(recorder.Body.String(), "1234") {
-		t.Fatalf("partial content was streamed before the 413 response: %q", recorder.Body.String())
+		t.Fatalf("partial content was streamed before the 401 response: %q", recorder.Body.String())
 	}
 }
 
 func TestDirectLinkRejectsInvalidPartialContentRange(t *testing.T) {
-	for _, contentRange := range []string{"", "bytes 0-3/*", "bytes 4-3/10"} {
+	for _, contentRange := range []string{"", "bytes 4-3/10", "bytes 0-8/10"} {
 		t.Run(contentRange, func(t *testing.T) {
 			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/octet-stream")
@@ -684,7 +679,7 @@ func TestGitHubDownloadStillFollowsExternalAssetRedirectWithoutLeakingAuthorizat
 	defer upstream.Close()
 
 	router := newGitHubProxyTestRouter(t, "")
-	routeGlobalHTTPClientToTestUpstream(t, upstream)
+	routeGlobalHTTPClientToTestUpstream(t, upstream, "cdn.example.com")
 	headers := http.Header{"Authorization": {"Bearer github-token"}}
 
 	recorder := performGitHubProxyRequest(router, http.MethodGet, "https://github.com/owner/repo/releases/download/v1/asset.zip", headers)
@@ -845,7 +840,7 @@ func TestExternalRedirectAppliesHTTPMethodAndBodySemantics(t *testing.T) {
 			defer upstream.Close()
 
 			router := newGitHubProxyTestRouter(t, "")
-			routeGlobalHTTPClientToTestUpstream(t, upstream)
+			routeGlobalHTTPClientToTestUpstream(t, upstream, "cdn.example.com")
 
 			recorder := performGitHubProxyRequestWithBody(
 				router,
@@ -880,7 +875,7 @@ func TestExternalRedirectAppliesHTTPMethodAndBodySemantics(t *testing.T) {
 			defer upstream.Close()
 
 			router := newGitHubProxyTestRouter(t, "")
-			routeGlobalHTTPClientToTestUpstream(t, upstream)
+			routeGlobalHTTPClientToTestUpstream(t, upstream, "cdn.example.com")
 
 			recorder := performGitHubProxyRequestWithBody(
 				router,
@@ -1095,6 +1090,7 @@ func TestDirectLinkStagingFailsFastAtAggregateQuota(t *testing.T) {
 			_, _ = w.Write([]byte("7"))
 			return
 		}
+		w.(http.Flusher).Flush() // Both responses need staging space.
 		_, _ = w.Write([]byte("7890"))
 	}))
 	defer upstream.Close()
@@ -1370,7 +1366,8 @@ func TestDirectLinkRequestDeadlineStopsTrickleUpstream(t *testing.T) {
 	directLinkStagingQuota = quota
 	directLinkRequestSlots = slots
 	directLinkBodyIdleTimeout = time.Second
-	directLinkRequestTimeout = 120 * time.Millisecond
+	// Include time for the loopback TLS handshake on loaded race-test runners.
+	directLinkRequestTimeout = 500 * time.Millisecond
 	t.Cleanup(func() {
 		directLinkStagingQuota = previousQuota
 		directLinkRequestSlots = previousSlots

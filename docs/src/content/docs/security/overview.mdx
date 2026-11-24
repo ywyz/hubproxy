@@ -13,7 +13,7 @@ HubProxy 作为开放代理服务，部署不当可能带来滥用风险。遵�
 | IP 黑白名单 | `[security]` 控制限流豁免与封禁 |
 | 资源访问控制 | `[access].whiteList` / `blackList` 限制仓库和镜像；独立的 `directLinkWhiteList` / `directLinkBlackList` 限制 HTTPS 直链 |
 | 可信代理 | 仅信任来自私网/本机的转发头，防止 IP 伪造 |
-| 文件大小限制 | `[server].fileSize` 防止超大文件滥用 |
+| 大文件鉴权 | 超过 `[server].fileSize` 门槛需要登录，完整文件和分段使用相同门槛 |
 | 离线下载 Token | 一次性 token，绑定 IP 与 User-Agent，2 分钟过期 |
 
 ## 未内置的能力
@@ -24,13 +24,13 @@ HubProxy **没有**管理后台登录、Basic Auth、API Key 或 Prometheus 指�
 
 1. **开放代理**：公网直连 `0.0.0.0:5000` 且无 `[access].whiteList` 时，任何人可代理任意受支持仓库；设置 `directLinkWhiteList = ["*/*"]` 还会开放任意 HTTPS 直链
 2. **IP 伪造**：反代未覆盖写 `X-Forwarded-For` 时，攻击者可绕过限流
-3. **Host 注入**：反代未设置 `X-Forwarded-Host` 时，`.sh` 脚本可能生成错误加速 URL
+3. **Host 注入**：反代未设置 `Host` 时，`.sh` 脚本可能生成错误加速 URL
 
 ## 推荐实践
 
 - 使用 [推荐部署架构](/deployment/architecture/)：CDN（可选）→ 反代 → HubProxy
 - 公网服务配置 `[access].whiteList` 限制仓库/镜像，并仅在确有需要时用窄范围的 `[access].directLinkWhiteList` 启用直链
-- 反代覆盖写 `X-Forwarded-For`、`X-Real-IP`、`X-Forwarded-Host`
+- 反代覆盖写 `X-Forwarded-For`、`X-Real-IP`、`Host`
 - 公网服务建议通过反代暴露，不直接开放 `5000` 端口
 - 定期审查 `[access].blackList`、`[access].directLinkBlackList` 与访问日志
 

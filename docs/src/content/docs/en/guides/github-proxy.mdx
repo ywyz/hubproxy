@@ -78,7 +78,7 @@ curl -L -O "https://example.com/github.com/owner/repo/releases/download/v1.0.0/a
 
 ## Script Nesting
 
-HubProxy can rewrite GitHub URLs inside `.sh` / `.ps1` install scripts (max 10MB). Behind a reverse proxy, set `X-Forwarded-Host` correctly — see [Reverse Proxy](/en/deployment/reverse-proxy/).
+HubProxy can rewrite GitHub URLs inside `.sh` / `.ps1` install scripts (max 10MB). Behind a reverse proxy, set `Host` correctly — see [Reverse Proxy](/en/deployment/reverse-proxy/).
 
 ## Limits and Blocks
 
@@ -88,8 +88,8 @@ HubProxy can rewrite GitHub URLs inside `.sh` / `.ps1` install scripts (max 10MB
 | Direct-link methods | Only `GET` and `HEAD` are allowed; Git smart HTTP and existing GitHub/Hugging Face methods are unchanged |
 | Direct-link request headers | Only download headers such as a single byte `Range`, validators, `Accept`, and `User-Agent` are forwarded; multi-range requests return 416, and `Authorization`, `Proxy-Authorization`, `Cookie`, and arbitrary custom headers are never forwarded |
 | Direct-link response headers | Responses are forced to `application/octet-stream` with `Content-Disposition: attachment` and `X-Content-Type-Options: nosniff`; origin authentication state such as `Set-Cookie`, `WWW-Authenticate`, and `Proxy-Authenticate` is removed |
-| Redirects | The HTTP client does not auto-follow. Relative `Location` values are resolved against the current URL, and every direct-link hop is rechecked for HTTPS, access-list permission, and a public target address. Rewritten bodyless redirects drop entity headers, and external redirects follow standard method semantics; a `307`/`308` that would require replaying a consumed body returns 502 |
-| File size | `[server].fileSize` caps single-file downloads (default 2GB). A direct-link GET is staged in a system temporary file while reading at most the limit plus one byte, so an oversized response returns 413 before any upstream body is sent. A process-wide quota keeps aggregate staged content within that “limit plus one byte,” and at most 16 direct-link requests may run concurrently across their full lifecycle, including DNS resolution, response-header wait, upstream retrieval and staging, and downstream delivery; a full quota or concurrency limit fails fast with 503. Upstream retrieval and staging are canceled with 504 if the response body makes no progress for two minutes or the direct-link operation (including all redirects) exceeds 30 minutes. A `206` response is also checked against the complete size in `Content-Range`; GitHub/Hugging Face keep their existing streaming and Range behavior |
+| Redirects | Direct links and mirrors check HTTPS, public IPs, and access rules on each hop. Same-origin GitHub and Hugging Face repository redirects can return a URL on the proxy. The server follows cross-origin redirects using pinned public IPs and strips source credentials. Recognized destination repositories are subject to their access rules. A `307`/`308` that would require replaying a consumed body returns 502. |
+| File size | Up to 2 GiB is anonymous by default. Larger files require a HubProxy login and stream without a file-size cap. For partial responses the threshold uses the complete size in `Content-Range`. When length is unknown, anonymous downloads are first checked in a temporary file with a shared disk quota. Direct links allow 16 concurrent requests; capacity exhaustion returns 503. |
 | Resource access | `[access].whiteList` / `blackList` restrict repositories and images only; `directLinkWhiteList` / `directLinkBlackList` independently restrict arbitrary direct links. A missing or empty direct-link allowlist denies by default. Direct links reject traversal, encoded delimiters, and recursively encoded percent signs before matching `{host}/{path-and-query}`. Hosts are case-insensitive and numerically equivalent ports are canonicalized, so omitted HTTPS ports, `:443`, and `:0443` are equivalent; paths and queries remain case-sensitive and are not whitespace-trimmed |
 
 HubProxy resolves direct-link hosts locally, requires every candidate address to be public, and tries the validated addresses in order. Proxy and `NO_PROXY` selection is evaluated against the original hostname before the connection is pinned to a validated IP. Hosts that are resolvable only by a SOCKS5 proxy are intentionally rejected because the proxy protocol does not reveal the actual destination IP for this SSRF check. Client disconnects cancel the upstream request and temporary-file staging. The pinned transport created for each request closes idle connections when the response ends. Access-denial logs omit direct-link query strings so signed URL credentials are not recorded.
@@ -110,6 +110,12 @@ blackList = ["*/malicious-repo"]
 directLinkWhiteList = ["ollama.com/download/*"]
 directLinkBlackList = []
 ```
+
+## Large downloads and IDM
+
+Set `HUBPROXY_DOWNLOAD_USERNAME` and `HUBPROXY_DOWNLOAD_PASSWORD` on the server, or set `username` and `password` under `[downloadAuth]`, then restart HubProxy. Use HTTPS. An instance without a configured account only serves anonymous downloads within the threshold.
+
+In a browser, sign in at `/login` on the HubProxy host and reopen the download. In Internet Download Manager, open **Downloads → Options → Site Logins → New** and save the HubProxy HTTPS origin and the same account. Add the ordinary HubProxy download URL to IDM. Each connection can authenticate independently. Parallel connections and resume require an upstream that supports byte ranges. [IDM documentation](https://www.internetdownloadmanager.com/support/using_idm/options.html)
 
 ## Related
 

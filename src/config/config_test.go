@@ -13,6 +13,10 @@ func TestLoadConfigUsesConfigPathAndEnvOverrides(t *testing.T) {
 host = "127.0.0.1"
 port = 5999
 
+[downloadAuth]
+username = "fixture-user"
+password = "file-password"
+
 [access]
 whiteList = ["legacy/*"]
 blackList = ["legacy/blocked"]
@@ -27,12 +31,17 @@ proxy = "socks5://127.0.0.1:1080"
 	t.Setenv("CONFIG_PATH", path)
 	t.Setenv("SERVER_PORT", "6001")
 	t.Setenv("ACCESS_PROXY", "")
+	t.Setenv("HUBPROXY_DOWNLOAD_USERNAME", "env-user")
+	t.Setenv("HUBPROXY_DOWNLOAD_PASSWORD", "env-password")
 
 	if err := LoadConfig(); err != nil {
 		t.Fatal(err)
 	}
 
 	cfg := GetConfig()
+	if cfg.DownloadAuth.Username != "env-user" || cfg.DownloadAuth.Password != "env-password" {
+		t.Fatal("download account environment overrides did not take precedence")
+	}
 	if cfg.Server.Host != "127.0.0.1" {
 		t.Fatalf("Server.Host = %q", cfg.Server.Host)
 	}
@@ -53,5 +62,16 @@ proxy = "socks5://127.0.0.1:1080"
 	}
 	if len(cfg.Access.DirectLinkBlackList) != 1 || cfg.Access.DirectLinkBlackList[0] != "downloads.example.com/files/private/*" {
 		t.Fatalf("Access.DirectLinkBlackList = %#v", cfg.Access.DirectLinkBlackList)
+	}
+	t.Setenv("HUBPROXY_DOWNLOAD_PASSWORD", "")
+	if err := LoadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if GetConfig().DownloadAuth.Password != "" {
+		t.Fatal("empty environment override should disable the configured download password")
+	}
+	t.Setenv("HUBPROXY_DOWNLOAD_USERNAME", "user:part")
+	if err := LoadConfig(); err == nil {
+		t.Fatal("a username containing the HTTP Basic separator cannot be used by download clients")
 	}
 }

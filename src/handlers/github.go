@@ -1,11 +1,14 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
@@ -18,10 +21,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/net/idna"
-	"hubproxy/config"
 	"hubproxy/utils"
 )
 
@@ -41,6 +45,7 @@ var (
 		// 捕获域名和路径，交由独立的直链访问名单进行限制。
 		regexp.MustCompile(`^https://([^/?#]+)/(.+)`),
 	}
+	githubBlobRoute = regexp.MustCompile(`^(https?://github\.com/[^/]+/[^/]+/)blob/`)
 )
 
 // 全局变量：被阻止的内容类型
@@ -93,9 +98,20 @@ var blockedDirectLinkNetworks = []netip.Prefix{
 	netip.MustParsePrefix("198.51.100.0/24"),
 	netip.MustParsePrefix("203.0.113.0/24"),
 	netip.MustParsePrefix("240.0.0.0/4"),
-	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/32"),    // Teredo tunneling.
+	netip.MustParsePrefix("2001:2::/48"),  // Benchmarking.
+	netip.MustParsePrefix("2001:10::/28"), // Deprecated ORCHID identifiers.
 	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"), // 6to4 tunneling.
+	netip.MustParsePrefix("3ffe::/16"), // Former 6bone space.
+	netip.MustParsePrefix("3fff::/20"), // Documentation.
 }
+
+// IANA currently assigns IPv6 global-unicast networks from 2000::/3.
+// This excludes reserved space, including the former site-local fec0::/10.
+// https://www.iana.org/assignments/ipv6-address-space/
+var globalIPv6Allocation = netip.MustParsePrefix("2000::/3")
+var wellKnownNAT64 = netip.MustParsePrefix("64:ff9b::/96")
 
 var lookupDirectLinkIPs = net.DefaultResolver.LookupNetIP
 
@@ -150,12 +166,21 @@ type directLinkQuotaWriter struct {
 	quota    *directLinkSpoolQuota
 	limit    int64
 	reserved int64
+	err      error
 }
 
 func (w *directLinkQuotaWriter) Write(p []byte) (int, error) {
 	size := int64(len(p))
+	if w.err != nil {
+		return 0, w.err
+	}
+	if size > w.limit-w.reserved {
+		w.err = errDownloadLoginRequired
+		return 0, w.err
+	}
 	if !w.quota.reserve(size, w.limit) {
-		return 0, errDirectLinkSpoolCapacity
+		w.err = errDirectLinkSpoolCapacity
+		return 0, w.err
 	}
 	written, err := w.file.Write(p)
 	if unwritten := size - int64(written); unwritten > 0 {
@@ -165,12 +190,8 @@ func (w *directLinkQuotaWriter) Write(p []byte) (int, error) {
 	if err == nil && written != len(p) {
 		err = io.ErrShortWrite
 	}
+	w.err = err
 	return written, err
-}
-
-func (w *directLinkQuotaWriter) release() {
-	w.quota.release(w.reserved)
-	w.reserved = 0
 }
 
 type directLinkIdleReadCloser struct {
@@ -214,7 +235,10 @@ func GitHubProxyHandler(c *gin.Context) {
 	}
 
 	// 自动补全协议头
-	if !strings.HasPrefix(rawPath, "https://") {
+	mirror := isMirrorRequest(c)
+	if mirror {
+		rawPath = "https://" + strings.TrimPrefix(rawPath, "mirrors/")
+	} else if !strings.HasPrefix(rawPath, "https://") {
 		if strings.HasPrefix(rawPath, "http:/") || strings.HasPrefix(rawPath, "https:/") {
 			rawPath = strings.Replace(rawPath, "http:/", "", 1)
 			rawPath = strings.Replace(rawPath, "https:/", "", 1)
@@ -224,7 +248,7 @@ func GitHubProxyHandler(c *gin.Context) {
 		rawPath = "https://" + rawPath
 	}
 
-	matches, directLink := matchGitHubURL(rawPath)
+	matches, directLink := matchDownloadURL(rawPath, mirror)
 	if matches != nil {
 		if directLink && c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
 			c.Header("Allow", "GET, HEAD")
@@ -259,8 +283,8 @@ func GitHubProxyHandler(c *gin.Context) {
 	}
 
 	// 将blob链接转换为raw链接
-	if githubExps[1].MatchString(rawPath) {
-		rawPath = strings.Replace(rawPath, "/blob/", "/raw/", 1)
+	if !mirror && !directLink {
+		rawPath = repositoryDownloadURL(rawPath)
 	}
 
 	ProxyGitHubRequest(c, rawPath)
@@ -268,14 +292,32 @@ func GitHubProxyHandler(c *gin.Context) {
 
 // CheckGitHubURL 检查URL是否匹配GitHub模式
 func CheckGitHubURL(u string) []string {
-	matches, _ := matchGitHubURL(u)
+	matches, _ := matchDownloadURL(u, false)
 	return matches
 }
 
-func matchGitHubURL(u string) ([]string, bool) {
-	for _, exp := range githubExps[:len(githubExps)-1] {
-		if matches := exp.FindStringSubmatch(u); matches != nil {
-			return matches[1:], false
+func isMirrorRequest(c *gin.Context) bool {
+	return strings.HasPrefix(c.Request.URL.EscapedPath(), "/mirrors/")
+}
+
+func repositoryDownloadURL(u string) string {
+	canonical, ok := canonicalRepositoryURL(u)
+	if !ok {
+		return u
+	}
+	return githubBlobRoute.ReplaceAllString(canonical, "${1}raw/")
+}
+
+func matchDownloadURL(u string, mirror bool) ([]string, bool) {
+	// Repository mirrors use the dedicated direct-link ACL on every hop, even
+	// when a mirror's host or redirect also matches a GitHub repository route.
+	if !mirror {
+		if repositoryURL, ok := canonicalRepositoryURL(u); ok {
+			for _, exp := range githubExps[:len(githubExps)-1] {
+				if matches := exp.FindStringSubmatch(repositoryURL); matches != nil {
+					return matches[1:], false
+				}
+			}
 		}
 	}
 	targetURL, err := url.Parse(u)
@@ -287,6 +329,25 @@ func matchGitHubURL(u string) ([]string, bool) {
 		return matches, true
 	}
 	return nil, false
+}
+
+// Normalize only the authority for repository routing. Keep escaped paths and
+// signed queries intact and preserve support for scheme-less repository URLs.
+func canonicalRepositoryURL(u string) (string, bool) {
+	scheme, _, absolute := strings.Cut(u, "://")
+	if !absolute || strings.ContainsAny(scheme, "/?#") {
+		u = "https://" + u
+	}
+	targetURL, err := url.Parse(u)
+	if err != nil || targetURL.User != nil || (targetURL.Scheme != "https" && targetURL.Scheme != "http") {
+		return "", false
+	}
+	authority, err := canonicalDirectLinkAuthority(targetURL)
+	if err != nil {
+		return "", false
+	}
+	targetURL.Host = authority
+	return targetURL.String(), true
 }
 
 func directLinkAccessMatches(targetURL *url.URL) ([]string, error) {
@@ -353,7 +414,8 @@ func canonicalDirectLinkAuthority(targetURL *url.URL) (string, error) {
 	if err != nil || portNumber < 1 || portNumber > 65535 {
 		return "", fmt.Errorf("无效的通用直链端口")
 	}
-	if portNumber == 443 {
+	if (targetURL.Scheme == "http" && portNumber == 80) ||
+		(strings.EqualFold(targetURL.Scheme, "https") && portNumber == 443) {
 		return hostname, nil
 	}
 	return net.JoinHostPort(strings.Trim(hostname, "[]"), strconv.Itoa(portNumber)), nil
@@ -361,11 +423,15 @@ func canonicalDirectLinkAuthority(targetURL *url.URL) (string, error) {
 
 // ProxyGitHubRequest 代理GitHub请求
 func ProxyGitHubRequest(c *gin.Context, u string) {
-	_, directLink := matchGitHubURL(u)
+	_, directLink := matchDownloadURL(u, isMirrorRequest(c))
 	if directLink {
-		requestContext, cancelRequest := context.WithTimeout(c.Request.Context(), directLinkRequestTimeout)
-		defer cancelRequest()
-		c.Request = c.Request.WithContext(requestContext)
+		requestContext := c.Request.Context()
+		if !DownloadAuthenticated(c) {
+			var cancel context.CancelFunc
+			requestContext, cancel = context.WithTimeout(requestContext, directLinkRequestTimeout)
+			defer cancel()
+			c.Request = c.Request.WithContext(requestContext)
+		}
 
 		requestSlots := directLinkRequestSlots
 		select {
@@ -397,13 +463,18 @@ func proxyGitHubWithRedirect(
 	requestState proxyRequestState,
 ) {
 	const maxRedirects = 20
+	mirror := isMirrorRequest(c)
 	if redirectCount > maxRedirects {
 		c.String(http.StatusLoopDetected, "重定向次数过多，可能存在循环重定向")
 		return
 	}
+	// Direct links and credential-stripped redirect hops dial a target chosen
+	// by an upstream response. Pin DNS, IP, and TLS on every such hop instead
+	// of trusting the shared outbound client pool.
+	pinnedHop := directLink || !forwardSourceCredentials
 	var directTargetAddresses []netip.Addr
 	var directTargetServerName string
-	if directLink {
+	if pinnedHop {
 		targetURL, err := url.Parse(u)
 		if err != nil {
 			c.String(http.StatusForbidden, "无效的通用直链地址")
@@ -417,7 +488,9 @@ func proxyGitHubWithRedirect(
 			c.String(http.StatusForbidden, err.Error())
 			return
 		}
-		matches, targetIsDirectLink := matchGitHubURL(targetURL.String())
+	}
+	if directLink {
+		matches, targetIsDirectLink := matchDownloadURL(u, mirror)
 		if matches == nil {
 			c.String(http.StatusForbidden, "无效的通用直链地址")
 			return
@@ -441,7 +514,7 @@ func proxyGitHubWithRedirect(
 	var requestErr error
 	var directTransport *http.Transport
 	var directRequestCancel context.CancelFunc
-	if directLink {
+	if pinnedHop {
 		baseTransport, ok := baseHTTPClient.Transport.(*http.Transport)
 		if !ok {
 			c.String(http.StatusInternalServerError, "通用直链 HTTP 传输配置无效")
@@ -509,7 +582,9 @@ func proxyGitHubWithRedirect(
 			httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			}
-			resp, requestErr = httpClient.Do(req)
+			var ctx context.Context
+			ctx, directRequestCancel = context.WithCancel(req.Context())
+			resp, requestErr = httpClient.Do(req.WithContext(ctx))
 		}
 	}
 	if directTransport != nil {
@@ -532,6 +607,11 @@ func proxyGitHubWithRedirect(
 		}
 	}()
 
+	sanitizeDownloadHeaders(resp.Header)
+	if DownloadAuthenticated(c) {
+		preventDownloadCaching(resp.Header)
+	}
+
 	if location := resp.Header.Get("Location"); location != "" && resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		currentURL, parseErr := url.Parse(u)
 		if parseErr != nil {
@@ -544,7 +624,7 @@ func proxyGitHubWithRedirect(
 			return
 		}
 		nextURL := currentURL.ResolveReference(locationURL)
-		matches, nextIsDirectLink := matchGitHubURL(nextURL.String())
+		matches, nextIsDirectLink := matchDownloadURL(nextURL.String(), mirror)
 		if directLink {
 			if !strings.EqualFold(nextURL.Scheme, "https") {
 				c.String(http.StatusForbidden, "通用直链重定向仅允许 HTTPS")
@@ -574,27 +654,35 @@ func proxyGitHubWithRedirect(
 			return
 		}
 
+		keepCredentials := forwardSourceCredentials && sameOrigin(currentURL, nextURL)
+		nextTarget := nextURL.String()
 		if matches != nil && !nextIsDirectLink {
-			copyResponseHeaders(c, resp.Header)
-			removeResponseEntityHeaders(c.Writer.Header())
-			c.Header("Location", "/"+nextURL.String())
-			c.Status(resp.StatusCode)
-			return
+			if allowed, reason := utils.GlobalAccessController.CheckGitHubAccess(matches); !allowed {
+				c.String(http.StatusForbidden, reason)
+				return
+			}
+			if keepCredentials {
+				copyResponseHeaders(c, resp.Header)
+				removeResponseEntityHeaders(c.Writer.Header())
+				c.Header("Location", "/"+nextURL.String())
+				c.Status(resp.StatusCode)
+				return
+			}
+			nextTarget = repositoryDownloadURL(nextTarget)
 		}
 
-		keepCredentials := forwardSourceCredentials && sameOrigin(currentURL, nextURL)
 		nextRequestState, redirectErr := redirectedProxyRequest(resp.StatusCode, requestState)
 		if redirectErr != nil {
 			c.String(http.StatusBadGateway, redirectErr.Error())
 			return
 		}
 		_ = resp.Body.Close()
-		proxyGitHubWithRedirect(c, nextURL.String(), redirectCount+1, false, keepCredentials, nextRequestState)
+		proxyGitHubWithRedirect(c, nextTarget, redirectCount+1, false, keepCredentials, nextRequestState)
 		return
 	}
 
 	// 检查并处理被阻止的内容类型
-	if c.Request.Method == "GET" {
+	if c.Request.Method == "GET" && !mirror {
 		if contentType := resp.Header.Get("Content-Type"); blockedContentTypes[strings.ToLower(strings.Split(contentType, ";")[0])] {
 			c.JSON(http.StatusForbidden, map[string]string{
 				"error":   "Content type not allowed",
@@ -604,94 +692,65 @@ func proxyGitHubWithRedirect(
 		}
 	}
 
-	// 检查文件大小限制
-	cfg := config.GetConfig()
-	if directLink && resp.StatusCode == http.StatusPartialContent {
-		totalSize, ok := contentRangeTotal(resp.Header.Get("Content-Range"))
-		if !ok {
-			c.String(http.StatusBadGateway, "上游返回了无效的 Content-Range")
-			return
-		}
-		if totalSize > cfg.Server.FileSize {
-			c.String(http.StatusRequestEntityTooLarge,
-				fmt.Sprintf("文件过大，限制大小: %d MB", cfg.Server.FileSize/(1024*1024)))
+	authenticated := DownloadAuthenticated(c)
+	rangeLength := int64(-1)
+	if resp.StatusCode == http.StatusPartialContent {
+		var allowed bool
+		rangeLength, allowed = downloadRangeLength(c, resp, directLink, authenticated)
+		if !allowed {
 			return
 		}
 	}
-	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
-		if size, err := strconv.ParseInt(contentLength, 10, 64); err == nil && size > cfg.Server.FileSize {
-			c.String(http.StatusRequestEntityTooLarge,
-				fmt.Sprintf("文件过大，限制大小: %d MB", cfg.Server.FileSize/(1024*1024)))
-			return
-		}
+	if !authenticated && resp.ContentLength > anonymousDownloadLimit() {
+		RequireDownloadLogin(c)
+		return
 	}
 
 	responseBody := io.Reader(resp.Body)
-	if directLink && c.Request.Method == http.MethodGet {
-		staged, err := os.CreateTemp("", "hubproxy-direct-*")
-		if err != nil {
-			c.String(http.StatusInternalServerError, "无法暂存直链响应")
-			return
-		}
-		stagedName := staged.Name()
-		var quotaWriter *directLinkQuotaWriter
-		defer func() {
-			if err := staged.Close(); err != nil {
-				fmt.Printf("关闭直链临时文件失败: %v\n", err)
+	hasBody := requestState.method != http.MethodHead && resp.StatusCode != http.StatusNotModified && resp.StatusCode != http.StatusNoContent
+	if hasBody {
+		reader := newDirectLinkIdleReadCloser(resp.Body, directLinkBodyIdleTimeout, directRequestCancel)
+		resp.Body = reader
+		responseBody = reader
+		if !authenticated && resp.ContentLength < 0 {
+			limit := anonymousDownloadLimit()
+			if rangeLength >= 0 {
+				limit = min(limit, rangeLength)
 			}
-			if err := os.Remove(stagedName); err != nil && !os.IsNotExist(err) {
-				fmt.Printf("删除直链临时文件失败: %v\n", err)
+			staged, err := stageAnonymousDownload(func(w *directLinkQuotaWriter) error {
+				_, err := io.Copy(w, io.LimitReader(reader, limit+1))
+				return err
+			})
+			if staged != nil {
+				defer staged.cleanup()
 			}
-			if quotaWriter != nil {
-				quotaWriter.release()
-			}
-		}()
-
-		limit := cfg.Server.FileSize
-		if limit <= 0 {
-			c.String(http.StatusRequestEntityTooLarge, "文件大小限制无效")
-			return
-		}
-		readLimit := limit
-		if limit < int64(^uint64(0)>>1) {
-			readLimit++
-		}
-		quotaWriter = &directLinkQuotaWriter{
-			file:  staged,
-			quota: directLinkStagingQuota,
-			limit: readLimit,
-		}
-		responseBodyWithTimeout := newDirectLinkIdleReadCloser(resp.Body, directLinkBodyIdleTimeout, directRequestCancel)
-		resp.Body = responseBodyWithTimeout
-		written, copyErr := io.Copy(quotaWriter, io.LimitReader(responseBodyWithTimeout, readLimit))
-		if responseBodyWithTimeout.timedOut.Load() {
-			c.String(http.StatusGatewayTimeout, "读取直链响应超时")
-			return
-		}
-		if finishDirectLinkContextError(c) {
-			return
-		}
-		if copyErr != nil {
-			if errors.Is(copyErr, errDirectLinkSpoolCapacity) {
-				c.String(http.StatusServiceUnavailable, "直链暂存空间繁忙，请稍后重试")
+			switch {
+			case reader.timedOut.Load():
+				c.String(http.StatusGatewayTimeout, "读取下载响应超时")
+				return
+			case finishDirectLinkContextError(c):
+				return
+			case err != nil:
+				if !handleDownloadStageError(c, err) {
+					c.String(http.StatusBadGateway, "读取下载响应失败")
+				}
 				return
 			}
-			c.String(http.StatusBadGateway, "读取直链响应失败")
-			return
+			if rangeLength >= 0 && staged.size != rangeLength {
+				c.String(http.StatusBadGateway, "上游分段长度与 Content-Range 不符")
+				return
+			}
+			responseBody = staged
+			resp.ContentLength = staged.size
+			resp.Header.Del("Transfer-Encoding")
+			resp.Header.Set("Content-Length", strconv.FormatInt(staged.size, 10))
 		}
-		if written > limit {
-			c.String(http.StatusRequestEntityTooLarge,
-				fmt.Sprintf("文件过大，限制大小: %d MB", limit/(1024*1024)))
-			return
-		}
-		if _, err := staged.Seek(0, io.SeekStart); err != nil {
-			c.String(http.StatusInternalServerError, "无法读取直链临时文件")
-			return
-		}
-		responseBody = staged
-		resp.Header.Del("Transfer-Encoding")
-		resp.Header.Set("Content-Length", strconv.FormatInt(written, 10))
 	}
+	if rangeLength >= 0 && resp.ContentLength < 0 {
+		resp.Header.Set("Content-Length", strconv.FormatInt(rangeLength, 10))
+		responseBody = io.LimitReader(responseBody, rangeLength)
+	}
+
 	if directLink {
 		for _, header := range directLinkResponseAuthenticationHeaders {
 			resp.Header.Del(header)
@@ -699,68 +758,59 @@ func proxyGitHubWithRedirect(
 	}
 
 	// 清理安全相关的头
-	resp.Header.Del("Content-Security-Policy")
+	resp.Header.Set("Content-Security-Policy", "sandbox; default-src 'none'")
+	resp.Header.Set("X-Content-Type-Options", "nosniff")
 	resp.Header.Del("Referrer-Policy")
 	resp.Header.Del("Strict-Transport-Security")
-	if directLink {
+	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if directLink || mediaType == "" || strings.Contains(mediaType, "javascript") || strings.Contains(mediaType, "ecmascript") ||
+		mediaType == "image/svg+xml" || mediaType == "text/css" || mediaType == "application/wasm" ||
+		mediaType == "text/html" || mediaType == "application/xhtml+xml" || mediaType == "text/livescript" || mediaType == "text/jscript" {
 		resp.Header.Set("Content-Type", "application/octet-stream")
-		resp.Header.Set("Content-Disposition", "attachment")
+		resp.Header.Set("Content-Disposition", downloadDisposition(resp.Header.Get("Content-Disposition")))
 		resp.Header.Set("X-Content-Type-Options", "nosniff")
 	}
 
-	// 获取真实域名
-	realHost := c.Request.Header.Get("X-Forwarded-Host")
-	if realHost == "" {
-		realHost = c.Request.Host
-	}
-	if !strings.HasPrefix(realHost, "http://") && !strings.HasPrefix(realHost, "https://") {
-		realHost = "https://" + realHost
-	}
-
-	// 处理.sh和.ps1文件的智能处理
-	if strings.HasSuffix(strings.ToLower(u), ".sh") || strings.HasSuffix(strings.ToLower(u), ".ps1") {
-		isGzipCompressed := resp.Header.Get("Content-Encoding") == "gzip"
-
-		processedBody, processedSize, err := utils.ProcessSmart(responseBody, isGzipCompressed, realHost)
-		if err != nil {
-			fmt.Printf("脚本处理失败: %v\n", err)
-			c.String(http.StatusBadGateway, "Script processing failed: %v", err)
-			return
-		}
-
-		// 智能设置响应头
-		if processedSize > 0 {
-			resp.Header.Del("Content-Length")
-			resp.Header.Del("Content-Encoding")
-			resp.Header.Set("Transfer-Encoding", "chunked")
-		}
-
-		// 复制其他响应头
-		for key, values := range resp.Header {
-			for _, value := range values {
-				c.Header(key, value)
+	// Download managers and package mirrors need the original bytes. Only
+	// transform small, ordinary anonymous script requests.
+	script := strings.HasSuffix(strings.ToLower(u), ".sh") || strings.HasSuffix(strings.ToLower(u), ".ps1")
+	if script && !mirror && !authenticated && requestState.method == http.MethodGet && resp.StatusCode == http.StatusOK &&
+		c.GetHeader("Range") == "" && resp.ContentLength >= 0 && resp.ContentLength <= utils.MaxShellSize {
+		proxyHost := "https://" + c.Request.Host
+		encoding := resp.Header.Get("Content-Encoding")
+		if encoding == "" || strings.EqualFold(encoding, "gzip") {
+			// Keep the encoded source as a fallback when gzip expands beyond
+			// the script rewriter's memory limit.
+			source, err := io.ReadAll(io.LimitReader(responseBody, utils.MaxShellSize+1))
+			if err != nil {
+				c.String(http.StatusBadGateway, "读取脚本失败")
+				return
+			}
+			responseBody = bytes.NewReader(source)
+			processed, size, err := utils.ProcessSmart(bytes.NewReader(source), encoding != "", proxyHost)
+			if err == nil && size <= anonymousDownloadLimit() {
+				responseBody = processed
+				preventDownloadCaching(resp.Header)
+				resp.Header.Del("Content-Encoding")
+				resp.Header.Del("ETag")
+				resp.Header.Del("Digest")
+				resp.Header.Set("Accept-Ranges", "none")
+				resp.Header.Set("Content-Length", strconv.FormatInt(size, 10))
 			}
 		}
-
-		c.Status(resp.StatusCode)
-
-		// 输出处理后的内容
-		if _, err := io.Copy(c.Writer, processedBody); err != nil {
-			return
-		}
-	} else {
-		// 复制响应头
-		for key, values := range resp.Header {
-			for _, value := range values {
-				c.Header(key, value)
+	}
+	copyResponseHeaders(c, resp.Header)
+	c.Status(resp.StatusCode)
+	if hasBody {
+		if n, err := copyDownloadResponse(c.Writer, responseBody); err != nil || (rangeLength >= 0 && n != rangeLength) {
+			if !c.Writer.Written() {
+				removeResponseEntityHeaders(c.Writer.Header())
+				c.String(http.StatusBadGateway, "下载传输中断")
+				return
 			}
-		}
-
-		c.Status(resp.StatusCode)
-
-		// 直接流式转发
-		if _, err := io.Copy(c.Writer, responseBody); err != nil {
-			fmt.Printf("转发响应体失败: %v\n", err)
+			// net/http terminates the stream without a final chunk. Clients
+			// can then distinguish an incomplete unknown-length transfer.
+			panic(http.ErrAbortHandler)
 		}
 	}
 }
@@ -777,12 +827,42 @@ func finishDirectLinkContextError(c *gin.Context) bool {
 	}
 }
 
+func preventDownloadCaching(header http.Header) {
+	for _, key := range []string{"CDN-Cache-Control", "Surrogate-Control", "Cloudflare-CDN-Cache-Control", "Expires"} {
+		header.Del(key)
+	}
+	header.Set("Cache-Control", "private, no-store")
+}
+
+// Remove connection-local, reverse-proxy, and browser-origin directives before
+// applying HubProxy's own response headers, including on redirect responses.
+func sanitizeDownloadHeaders(header http.Header) {
+	for _, value := range header.Values("Connection") {
+		for _, key := range strings.Split(value, ",") {
+			header.Del(strings.TrimSpace(key))
+		}
+	}
+	for key := range header {
+		name := strings.ToLower(key)
+		if strings.HasPrefix(name, "x-accel-") || strings.HasPrefix(name, "access-control-") {
+			header.Del(key)
+		}
+	}
+	for _, key := range []string{
+		"Connection", "Proxy-Connection", "Keep-Alive", "TE", "Trailer", "Transfer-Encoding", "Upgrade",
+		"Set-Cookie", "Set-Cookie2", "Clear-Site-Data", "Refresh", "Service-Worker-Allowed", "Alt-Svc", "Link",
+	} {
+		header.Del(key)
+	}
+}
+
 func copyResponseHeaders(c *gin.Context, headers http.Header) {
 	for key, values := range headers {
 		for _, value := range values {
-			c.Header(key, value)
+			c.Writer.Header().Add(key, value)
 		}
 	}
+	c.Writer.Header().Add("Vary", "Cookie, Authorization")
 }
 
 func removeResponseEntityHeaders(headers http.Header) {
@@ -854,34 +934,86 @@ func redirectedProxyRequest(statusCode int, current proxyRequestState) (proxyReq
 }
 
 func sameOrigin(left, right *url.URL) bool {
-	return left != nil && right != nil &&
-		strings.EqualFold(left.Scheme, right.Scheme) &&
-		strings.EqualFold(left.Host, right.Host)
+	if left == nil || right == nil || !strings.EqualFold(left.Scheme, right.Scheme) ||
+		(left.Scheme != "http" && left.Scheme != "https") || left.User != nil || right.User != nil {
+		return false
+	}
+	a, leftErr := canonicalDirectLinkAuthority(left)
+	b, rightErr := canonicalDirectLinkAuthority(right)
+	return leftErr == nil && rightErr == nil && a == b
 }
 
-func contentRangeTotal(value string) (int64, bool) {
-	unit, rangeAndTotal, ok := strings.Cut(strings.TrimSpace(value), " ")
-	if !ok || !strings.EqualFold(unit, "bytes") {
-		return 0, false
+// Only carry a portable filename across origins. mime.ParseMediaType resolves
+// RFC 5987 filename* and FormatMediaType quotes or encodes it for the recipient.
+func downloadDisposition(header string) string {
+	_, params, err := mime.ParseMediaType(header)
+	name := params["filename"]
+	if err != nil || name == "" || name == "~" || name == "." || name == ".." || !utf8.ValidString(name) ||
+		strings.TrimSpace(name) != name || strings.HasSuffix(name, ".") || strings.ContainsAny(name, `/\<>:"|?*`) ||
+		strings.ContainsFunc(name, func(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }) {
+		return "attachment"
 	}
-	rangePart, totalPart, ok := strings.Cut(rangeAndTotal, "/")
-	if !ok || rangePart == "" || totalPart == "" || totalPart == "*" {
-		return 0, false
+	// Windows device names also keep their special meaning with an extension.
+	base, _, _ := strings.Cut(strings.ToUpper(name), ".")
+	base = strings.TrimRight(base, " ")
+	switch base {
+	case "CON", "NUL", "PRN", "AUX", "CONIN$", "CONOUT$":
+		return "attachment"
 	}
-	total, err := strconv.ParseInt(totalPart, 10, 64)
-	if err != nil || total <= 0 {
-		return 0, false
+	if strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT") {
+		suffix := base[3:]
+		if utf8.RuneCountInString(suffix) == 1 && strings.Contains("123456789¹²³", suffix) {
+			return "attachment"
+		}
 	}
-	startPart, endPart, ok := strings.Cut(rangePart, "-")
-	if !ok {
-		return 0, false
+	return mime.FormatMediaType("attachment", map[string]string{"filename": name})
+}
+
+// downloadRangeLength gates a partial response on the whole representation.
+// A multipart response has no single complete length at the header level.
+func downloadRangeLength(c *gin.Context, resp *http.Response, directLink, authenticated bool) (int64, bool) {
+	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if !directLink && mediaType == "multipart/byteranges" {
+		if !authenticated {
+			RequireDownloadLogin(c)
+		}
+		return -1, authenticated
 	}
-	start, startErr := strconv.ParseInt(startPart, 10, 64)
-	end, endErr := strconv.ParseInt(endPart, 10, 64)
-	if startErr != nil || endErr != nil || start < 0 || end < start || end >= total {
-		return 0, false
+
+	start, end, total, valid := parseDownloadRange(resp.Header.Get("Content-Range"))
+	if !valid || end-start == math.MaxInt64 || (resp.ContentLength >= 0 && resp.ContentLength-1 != end-start) {
+		c.String(http.StatusBadGateway, "上游返回了无效的 Content-Range")
+		return -1, false
 	}
-	return total, true
+	if !authenticated && (total < 0 || total > anonymousDownloadLimit()) {
+		RequireDownloadLogin(c)
+		return -1, false
+	}
+	return end - start + 1, true
+}
+
+func parseDownloadRange(value string) (start, end, total int64, valid bool) {
+	unit, spanAndTotal, ok := strings.Cut(strings.TrimSpace(value), " ")
+	span, totalText, hasTotal := strings.Cut(spanAndTotal, "/")
+	first, last, hasSpan := strings.Cut(span, "-")
+	if !ok || !strings.EqualFold(unit, "bytes") || !hasTotal || !hasSpan {
+		return
+	}
+	parse := func(text string) (int64, error) {
+		// The HTTP range grammar only admits unsigned decimal digits.
+		n, err := strconv.ParseUint(text, 10, 63)
+		return int64(n), err
+	}
+	start, startErr := parse(first)
+	end, endErr := parse(last)
+	if startErr != nil || endErr != nil || end < start {
+		return
+	}
+	if totalText == "*" {
+		return start, end, -1, true
+	}
+	total, err := parse(totalText)
+	return start, end, total, err == nil && end < total
 }
 
 func validateDirectLinkTarget(ctx context.Context, targetURL *url.URL) ([]netip.Addr, string, error) {
@@ -911,11 +1043,18 @@ func validateDirectLinkTarget(ctx context.Context, targetURL *url.URL) ([]netip.
 	validated := make([]netip.Addr, 0, len(addresses))
 	for _, address := range addresses {
 		address = address.Unmap()
-		if !address.IsGlobalUnicast() || address.IsPrivate() {
+		check := address
+		if wellKnownNAT64.Contains(address) {
+			// A DNS64 resolver on an IPv6-only host can synthesize either a
+			// public or local IPv4 target. Validate the embedded destination.
+			raw := address.As16()
+			check = netip.AddrFrom4([4]byte(raw[12:]))
+		}
+		if !check.IsGlobalUnicast() || check.IsPrivate() || (check.Is6() && !globalIPv6Allocation.Contains(check)) {
 			return nil, "", fmt.Errorf("通用直链目标地址不可访问")
 		}
 		for _, blocked := range blockedDirectLinkNetworks {
-			if blocked.Contains(address) {
+			if blocked.Contains(check) {
 				return nil, "", fmt.Errorf("通用直链目标地址不可访问")
 			}
 		}

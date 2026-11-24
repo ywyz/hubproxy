@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -151,10 +152,12 @@ type SingleDownloadRequest struct {
 }
 
 type tokenEntry[T any] struct {
-	Request   T
-	ExpiresAt time.Time
-	IP        string
-	UserAgent string
+	LoginRequired bool
+	inFlight      bool
+	Request       T
+	ExpiresAt     time.Time
+	IP            string
+	UserAgent     string
 }
 
 type tokenStore[T any] struct {
@@ -197,31 +200,45 @@ func (s *tokenStore[T]) create(req T, ip, userAgent string) (string, error) {
 	return token, nil
 }
 
-func (s *tokenStore[T]) consume(token, ip, userAgent string) (T, bool) {
+var errInvalidDownloadToken = errors.New("无效或过期的下载令牌")
+
+// A token reserves its slot until delivery finishes. After an authentication
+// challenge or a busy spool the same client can retry the same URL.
+func (s *tokenStore[T]) claim(token, ip, userAgent string, authenticated bool) (T, func(error), error) {
 	var empty T
-	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	entry, exists := s.entries[token]
-	if !exists {
-		return empty, false
+	if !exists || entry.inFlight || entry.IP != ip || entry.UserAgent != userAgent {
+		return empty, nil, errInvalidDownloadToken
 	}
-	if now.After(entry.ExpiresAt) {
+	if !time.Now().Before(entry.ExpiresAt) {
 		delete(s.entries, token)
-		return empty, false
+		return empty, nil, errInvalidDownloadToken
 	}
-	if entry.IP != ip || entry.UserAgent != userAgent {
+	if entry.LoginRequired && !authenticated {
+		return empty, nil, errDownloadLoginRequired
+	}
+	entry.inFlight = true
+	s.entries[token] = entry
+	finish := func(err error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if errors.Is(err, errDownloadLoginRequired) || errors.Is(err, errDirectLinkSpoolCapacity) {
+			entry.LoginRequired = entry.LoginRequired || errors.Is(err, errDownloadLoginRequired)
+			entry.inFlight = false
+			entry.ExpiresAt = time.Now().Add(downloadTokenTTL)
+			s.entries[token] = entry
+			return
+		}
 		delete(s.entries, token)
-		return empty, false
 	}
-	delete(s.entries, token)
-	return entry.Request, true
+	return entry.Request, finish, nil
 }
 
 func (s *tokenStore[T]) cleanup(now time.Time) {
 	for token, entry := range s.entries {
-		if now.After(entry.ExpiresAt) {
+		if !entry.inFlight && !now.Before(entry.ExpiresAt) {
 			delete(s.entries, token)
 		}
 	}
@@ -241,6 +258,42 @@ type ImageStreamerConfig struct {
 	Concurrency int
 }
 
+// go-containerregistry reads manifests, configs and layers through this
+// transport. A stalled read must release the archive's temporary-file budget.
+type archiveRegistryTransport struct {
+	http.RoundTripper
+	idle time.Duration
+}
+
+func (t archiveRegistryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, cancel := context.WithCancel(req.Context())
+	resp, err := t.RoundTripper.RoundTrip(req.WithContext(ctx))
+	if err != nil || resp.Body == nil || resp.Body == http.NoBody {
+		cancel()
+		return resp, err
+	}
+	resp.Body = &archiveRegistryBody{newDirectLinkIdleReadCloser(resp.Body, t.idle, cancel), cancel}
+	return resp, nil
+}
+
+type archiveRegistryBody struct {
+	*directLinkIdleReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *archiveRegistryBody) Read(p []byte) (int, error) {
+	n, err := b.directLinkIdleReadCloser.Read(p)
+	if b.timedOut.Load() {
+		return n, context.DeadlineExceeded
+	}
+	return n, err
+}
+
+func (b *archiveRegistryBody) Close() error {
+	b.cancel()
+	return b.directLinkIdleReadCloser.Close()
+}
+
 // NewImageStreamer 创建镜像下载器
 func NewImageStreamer(cfg *ImageStreamerConfig) *ImageStreamer {
 	if cfg == nil {
@@ -258,7 +311,7 @@ func NewImageStreamer(cfg *ImageStreamerConfig) *ImageStreamer {
 
 	remoteOptions := []remote.Option{
 		remote.WithAuth(authn.Anonymous),
-		remote.WithTransport(utils.GetGlobalHTTPClient().Transport),
+		remote.WithTransport(archiveRegistryTransport{utils.GetGlobalHTTPClient().Transport, directLinkBodyIdleTimeout}),
 	}
 
 	return &ImageStreamer{
@@ -269,6 +322,7 @@ func NewImageStreamer(cfg *ImageStreamerConfig) *ImageStreamer {
 
 // StreamOptions 下载选项
 type StreamOptions struct {
+	anonymousBudget     *directLinkQuotaWriter
 	Platform            string
 	Compression         bool
 	UseCompressedLayers bool
@@ -287,7 +341,7 @@ func (is *ImageStreamer) StreamImageToWriter(ctx context.Context, imageRef strin
 
 	log.Printf("开始下载镜像: %s", ref.String())
 
-	contextOptions := append(is.remoteOptions, remote.WithContext(ctx))
+	contextOptions := append(is.remoteOptions[:len(is.remoteOptions):len(is.remoteOptions)], remote.WithContext(ctx))
 
 	desc, err := is.getImageDescriptor(ref, contextOptions)
 	if err != nil {
@@ -325,7 +379,11 @@ func writeDownloadError(c *gin.Context, err error, message string) {
 		log.Printf("%s: %v", message, err)
 		return
 	}
-	c.JSON(http.StatusInternalServerError, gin.H{"error": message + ": " + err.Error()})
+	status := http.StatusInternalServerError
+	if errors.Is(err, context.DeadlineExceeded) {
+		status = http.StatusGatewayTimeout
+	}
+	c.JSON(status, gin.H{"error": message + ": " + err.Error()})
 }
 
 // StreamImageToGin 流式响应到Gin
@@ -334,27 +392,45 @@ func (is *ImageStreamer) StreamImageToGin(ctx context.Context, imageRef string, 
 		options = &StreamOptions{UseCompressedLayers: true}
 	}
 
-	ref, err := name.ParseReference(imageRef)
-	if err != nil {
-		return fmt.Errorf("解析镜像引用失败: %w", err)
-	}
-
-	contextOptions := append(is.remoteOptions, remote.WithContext(ctx))
-	desc, err := is.getImageDescriptor(ref, contextOptions)
-	if err != nil {
-		return fmt.Errorf("获取镜像描述失败: %w", err)
-	}
-
 	filename := strings.ReplaceAll(imageRef, "/", "_") + ".tar"
-	setDownloadHeaders(c, filename, options.Compression)
+	return serveImageArchive(c, filename, options, func(w io.Writer, options *StreamOptions) error {
+		return is.StreamImageToWriter(ctx, imageRef, w, options)
+	})
+}
 
-	switch desc.MediaType {
-	case types.OCIImageIndex, types.DockerManifestList:
-		return is.streamMultiArchImage(ctx, desc, c.Writer, options, imageRef)
-	case types.OCIManifestSchema1, types.DockerManifestSchema2:
-		return is.streamSingleImage(ctx, desc, c.Writer, options, imageRef)
-	default:
-		return is.streamSingleImage(ctx, desc, c.Writer, options, imageRef)
+// A generated archive has no Content-Length until its final tar padding and
+// optional compression trailer have been written.
+func serveImageArchive(c *gin.Context, filename string, options *StreamOptions, write func(io.Writer, *StreamOptions) error) error {
+	if DownloadAuthenticated(c) {
+		setDownloadHeaders(c, filename, options.Compression)
+		if err := write(downloadResponseWriter(c.Writer), options); err != nil {
+			if c.Writer.Written() {
+				panic(http.ErrAbortHandler)
+			}
+			removeResponseEntityHeaders(c.Writer.Header())
+			c.Header("Content-Disposition", "")
+			return err
+		}
+		return nil
+	}
+	staged, err := stageAnonymousDownload(func(w *directLinkQuotaWriter) error {
+		bounded := *options
+		bounded.anonymousBudget = w
+		return write(w, &bounded)
+	})
+	if err != nil {
+		return err
+	}
+	defer staged.cleanup()
+	setDownloadHeaders(c, filename, options.Compression)
+	c.Header("Content-Length", fmt.Sprint(staged.size))
+	_, err = copyDownloadResponse(c.Writer, staged)
+	return err
+}
+
+func closeArchiveWriter(w io.Closer, result *error) {
+	if *result == nil {
+		*result = w.Close()
 	}
 }
 
@@ -379,17 +455,17 @@ func (is *ImageStreamer) streamSingleImage(ctx context.Context, desc *remote.Des
 }
 
 // streamImageLayers 处理镜像层
-func (is *ImageStreamer) streamImageLayers(ctx context.Context, img v1.Image, writer io.Writer, options *StreamOptions, imageRef string) error {
+func (is *ImageStreamer) streamImageLayers(ctx context.Context, img v1.Image, writer io.Writer, options *StreamOptions, imageRef string) (err error) {
 	var finalWriter io.Writer = writer
 
 	if options.Compression {
 		gzWriter := gzip.NewWriter(writer)
-		defer gzWriter.Close()
+		defer closeArchiveWriter(gzWriter, &err)
 		finalWriter = gzWriter
 	}
 
 	tarWriter := tar.NewWriter(finalWriter)
-	defer tarWriter.Close()
+	defer closeArchiveWriter(tarWriter, &err)
 
 	configFile, err := img.ConfigFile()
 	if err != nil {
@@ -404,6 +480,23 @@ func (is *ImageStreamer) streamImageLayers(ctx context.Context, img v1.Image, wr
 	log.Printf("镜像包含 %d 层", len(layers))
 
 	return is.streamDockerFormat(ctx, tarWriter, img, layers, configFile, imageRef, options)
+}
+
+func uncompressedLayerSize(layer v1.Layer, budget *directLinkQuotaWriter) (int64, error) {
+	if budget == nil {
+		return partial.UncompressedSize(layer)
+	}
+	r, err := layer.Uncompressed()
+	if err != nil {
+		return 0, err
+	}
+	defer r.Close()
+	remaining := budget.limit - budget.reserved
+	n, err := io.Copy(io.Discard, io.LimitReader(r, remaining+1))
+	if n > remaining {
+		return 0, errDownloadLoginRequired
+	}
+	return n, err
 }
 
 // streamDockerFormat 生成Docker格式
@@ -470,9 +563,12 @@ func (is *ImageStreamer) streamDockerFormatWithReturn(ctx context.Context, tarWr
 				if err != nil {
 					return err
 				}
+				if budget := options.anonymousBudget; budget != nil && layerSize > budget.limit-budget.reserved {
+					return errDownloadLoginRequired
+				}
 				layerReader, err = layer.Compressed()
 			} else {
-				layerSize, err = partial.UncompressedSize(layer)
+				layerSize, err = uncompressedLayerSize(layer, options.anonymousBudget)
 				if err != nil {
 					return err
 				}
@@ -603,7 +699,7 @@ func (is *ImageStreamer) streamSingleImageForBatch(ctx context.Context, tarWrite
 		return nil, nil, fmt.Errorf("解析镜像引用失败: %w", err)
 	}
 
-	contextOptions := append(is.remoteOptions, remote.WithContext(ctx))
+	contextOptions := append(is.remoteOptions[:len(is.remoteOptions):len(is.remoteOptions)], remote.WithContext(ctx))
 
 	desc, err := is.getImageDescriptor(ref, contextOptions)
 	if err != nil {
@@ -723,6 +819,7 @@ func resolveImageRef(c *gin.Context) string {
 
 // handleDirectImageDownload 处理单镜像下载
 func handleDirectImageDownload(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	imageRef := resolveImageRef(c)
 	if imageRef == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少镜像参数"})
@@ -785,11 +882,15 @@ func handleDirectImageDownload(c *gin.Context) {
 	}
 
 	ip, userAgent := getClientIdentity(c)
-	req, ok := singleDownloadTokens.consume(token, ip, userAgent)
-	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无效或过期的下载令牌"})
+	req, finish, err := singleDownloadTokens.claim(token, ip, userAgent, DownloadAuthenticated(c))
+	if err != nil {
+		if !handleDownloadStageError(c, err) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		}
 		return
 	}
+	defer func() { finish(err) }()
+
 	if req.Image != imageRef {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "下载令牌与镜像不匹配"})
 		return
@@ -808,14 +909,17 @@ func handleDirectImageDownload(c *gin.Context) {
 	ctx := c.Request.Context()
 	log.Printf("下载镜像: %s (平台: %s)", req.Image, formatPlatformText(req.Platform))
 
-	if err := globalImageStreamer.StreamImageToGin(ctx, req.Image, c, options); err != nil {
-		writeDownloadError(c, err, "镜像下载失败")
+	if err = globalImageStreamer.StreamImageToGin(ctx, req.Image, c, options); err != nil {
+		if !handleDownloadStageError(c, err) {
+			writeDownloadError(c, err, "镜像下载失败")
+		}
 		return
 	}
 }
 
 // handleSimpleBatchDownload 处理批量下载
 func handleSimpleBatchDownload(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	if c.Request.Method == http.MethodGet {
 		token := c.Query("token")
 		if token == "" {
@@ -824,11 +928,15 @@ func handleSimpleBatchDownload(c *gin.Context) {
 		}
 
 		ip, userAgent := getClientIdentity(c)
-		req, ok := batchDownloadTokens.consume(token, ip, userAgent)
-		if !ok {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "无效或过期的下载令牌"})
+		req, finish, err := batchDownloadTokens.claim(token, ip, userAgent, DownloadAuthenticated(c))
+		if err != nil {
+			if !handleDownloadStageError(c, err) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			}
 			return
 		}
+
+		defer func() { finish(err) }()
 
 		if len(req.Images) == 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "镜像列表不能为空"})
@@ -845,10 +953,12 @@ func handleSimpleBatchDownload(c *gin.Context) {
 		log.Printf("批量下载 %d 个镜像 (平台: %s)", len(req.Images), formatPlatformText(req.Platform))
 
 		filename := fmt.Sprintf("batch_%d_images.tar", len(req.Images))
-		setDownloadHeaders(c, filename, options.Compression)
-
-		if err := globalImageStreamer.StreamMultipleImages(ctx, req.Images, c.Writer, options); err != nil {
-			writeDownloadError(c, err, "批量镜像下载失败")
+		if err = serveImageArchive(c, filename, options, func(w io.Writer, options *StreamOptions) error {
+			return globalImageStreamer.StreamMultipleImages(ctx, req.Images, w, options)
+		}); err != nil {
+			if !handleDownloadStageError(c, err) {
+				writeDownloadError(c, err, "批量镜像下载失败")
+			}
 			return
 		}
 		return
@@ -995,7 +1105,7 @@ func handleImageInfo(c *gin.Context) {
 }
 
 // StreamMultipleImages 批量下载多个镜像
-func (is *ImageStreamer) StreamMultipleImages(ctx context.Context, imageRefs []string, writer io.Writer, options *StreamOptions) error {
+func (is *ImageStreamer) StreamMultipleImages(ctx context.Context, imageRefs []string, writer io.Writer, options *StreamOptions) (err error) {
 	if options == nil {
 		options = &StreamOptions{UseCompressedLayers: true}
 	}
@@ -1003,12 +1113,12 @@ func (is *ImageStreamer) StreamMultipleImages(ctx context.Context, imageRefs []s
 	var finalWriter io.Writer = writer
 	if options.Compression {
 		gzWriter := gzip.NewWriter(writer)
-		defer gzWriter.Close()
+		defer closeArchiveWriter(gzWriter, &err)
 		finalWriter = gzWriter
 	}
 
 	tarWriter := tar.NewWriter(finalWriter)
-	defer tarWriter.Close()
+	defer closeArchiveWriter(tarWriter, &err)
 
 	var allManifests []map[string]interface{}
 	var allRepositories = make(map[string]map[string]string)
@@ -1022,9 +1132,7 @@ func (is *ImageStreamer) StreamMultipleImages(ctx context.Context, imageRefs []s
 
 		log.Printf("处理镜像 %d/%d: %s", i+1, len(imageRefs), imageRef)
 
-		timeoutCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
-		manifest, repositories, err := is.streamSingleImageForBatch(timeoutCtx, tarWriter, imageRef, options)
-		cancel()
+		manifest, repositories, err := is.streamSingleImageForBatch(ctx, tarWriter, imageRef, options)
 
 		if err != nil {
 			log.Printf("下载镜像 %s 失败: %v", imageRef, err)
