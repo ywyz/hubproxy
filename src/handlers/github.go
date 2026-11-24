@@ -454,6 +454,69 @@ func ProxyGitHubRequest(c *gin.Context, u string) {
 	proxyGitHubWithRedirect(c, u, 0, directLink, true, requestState)
 }
 
+func pinnedDownloadTransport(base *http.Transport, req *http.Request, serverName string) (*http.Transport, error) {
+	transport := base.Clone()
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	}
+	transport.TLSClientConfig.ServerName = serverName
+	if base.Proxy == nil {
+		return transport, nil
+	}
+
+	// Select the route (including NO_PROXY) before the caller pins req.URL.Host to an IP.
+	proxyURL, err := base.Proxy(req)
+	if err != nil {
+		return nil, err
+	}
+	transport.Proxy = http.ProxyURL(proxyURL)
+	if proxyURL != nil && proxyURL.Scheme == "https" && transport.DialTLSContext == nil && transport.DialTLS == nil {
+		// net/http uses this dialer for the first TLS hop. After CONNECT it uses
+		// TLSClientConfig to authenticate the download host through the tunnel.
+		transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialHTTPSProxy(ctx, base, network, addr)
+		}
+	}
+	return transport, nil
+}
+
+func dialHTTPSProxy(ctx context.Context, base *http.Transport, network, addr string) (net.Conn, error) {
+	proxyHost, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	proxyTLS := &tls.Config{}
+	if base.TLSClientConfig != nil {
+		proxyTLS = base.TLSClientConfig.Clone()
+	}
+	proxyTLS.ServerName = proxyHost
+	proxyTLS.NextProtos = []string{"http/1.1"} // net/http writes CONNECT using HTTP/1.1.
+
+	var conn net.Conn
+	switch {
+	case base.DialContext != nil:
+		conn, err = base.DialContext(ctx, network, addr)
+	case base.Dial != nil:
+		conn, err = base.Dial(network, addr)
+	default:
+		conn, err = (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if base.TLSHandshakeTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, base.TLSHandshakeTimeout)
+		defer cancel()
+	}
+	tlsConn := tls.Client(conn, proxyTLS)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
 // proxyGitHubWithRedirect 带重定向的GitHub代理请求
 func proxyGitHubWithRedirect(
 	c *gin.Context,
@@ -528,26 +591,12 @@ func proxyGitHubWithRedirect(
 			}
 			attemptContext, cancelAttempt := context.WithCancel(req.Context())
 			req = req.WithContext(attemptContext)
-			transport := baseTransport.Clone()
-			if baseTransport.Proxy != nil {
-				// Decide proxy/NO_PROXY routing from the original hostname before
-				// pinning the validated public address used for the actual dial.
-				proxyURL, proxyErr := baseTransport.Proxy(req)
-				if proxyErr != nil {
-					cancelAttempt()
-					requestErr = proxyErr
-					break
-				}
-				transport.Proxy = func(*http.Request) (*url.URL, error) {
-					return proxyURL, nil
-				}
+			transport, err := pinnedDownloadTransport(baseTransport, req, directTargetServerName)
+			if err != nil {
+				cancelAttempt()
+				requestErr = err
+				break
 			}
-			if transport.TLSClientConfig == nil {
-				transport.TLSClientConfig = &tls.Config{}
-			} else {
-				transport.TLSClientConfig = transport.TLSClientConfig.Clone()
-			}
-			transport.TLSClientConfig.ServerName = directTargetServerName
 			originalHost := req.URL.Host
 			port := req.URL.Port()
 			if port == "" {
