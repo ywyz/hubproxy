@@ -1,59 +1,121 @@
-﻿---
+---
 title: Docker Deployment
-description: Deploy HubProxy with Docker and Docker Compose.
+description: Run HubProxy from source or build, deploy, and roll back a tested release image.
 ---
 
-## docker run
+## Run locally from source
 
-```bash
-docker build -t hubproxy:local .
-docker run -d \
-  --name hubproxy \
-  -p 5000:5000 \
-  --restart always \
-  hubproxy:local
-```
-
-The image includes an allowlist for common Linux package repositories. To use your own configuration, mount `./src/config.toml:/app/config.toml:ro`. To enable authenticated downloads, add `--env-file /path/to/hubproxy.env` to `docker run` and store `HUBPROXY_DOWNLOAD_USERNAME` and `HUBPROXY_DOWNLOAD_PASSWORD` in that file.
-
-## Docker Compose
-
-The repository includes `docker-compose.yml`:
+From the repository root, use the supplied `docker-compose.yml`. It builds `hubproxy:local`, publishes host port `5000`, and mounts `./src/config.toml` read-only at `/app/config.toml`.
 
 ```bash
 docker compose up -d --build
+curl -fsS --retry 5 --retry-connrefused --retry-delay 1 http://127.0.0.1:5000/ready
 ```
 
-Mounts `./src/config.toml` to `/app/config.toml`. Log rotation (`200m × 3`) is preconfigured in Compose — no need to duplicate in `docker run`.
-
-:::caution
-In production, avoid mapping port 5000 directly to the public internet. Let a Caddy/Nginx container reach HubProxy on the internal network instead.
-:::
-
-## With Reverse Proxy
-
-Typical Compose layout:
-
-```
-caddy:    exposes 443, proxies to hubproxy:5000
-hubproxy: internal 5000 only, not mapped to host public interface
-```
-
-## Health Check
-
-The image has no built-in `HEALTHCHECK`. Verify manually:
+To run Docker directly, bind the port to loopback and use the configuration and package mirror allowlist bundled with the image.
 
 ```bash
-curl http://127.0.0.1:5000/ready
+docker build -t hubproxy:local .
+docker run -d --name hubproxy -p 127.0.0.1:5000:5000 --restart unless-stopped hubproxy:local
 ```
 
-## Compose Logging (Optional)
+## Build and transfer a release image
 
-When using Compose, `docker-compose.yml` configures:
+Use the following Bash commands when the deployment host receives a prebuilt image. Start on the build machine with the reviewed changes merged into `main`. The build uses Node.js 24, Go 1.26, and Docker Buildx. The example targets `linux/amd64`. For another architecture, change the build platform, archive name, and host architecture check together. Replace the example SSH target with an account that can manage Docker and write to the deployment directory.
 
-| Option | Meaning |
-|--------|---------|
-| `max-size=200m` | Max size per log file |
-| `max-file=3` | Keep 3 files (~600MB total) |
+```bash
+set -euo pipefail
+git switch main
+git pull --ff-only origin main
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+test -z "$(git status --porcelain)"
+(cd web && npm ci && npm run build)
+(cd src && go test ./...)
 
-Without options, `docker run` defaults to ~20MB per log file.
+revision=$(git rev-parse HEAD)
+version=git-${revision:0:12}
+docker buildx build --platform linux/amd64 --load \
+  --build-arg "VERSION=$version" \
+  --label "org.opencontainers.image.revision=$revision" \
+  -t "hubproxy:$version" .
+
+out=$(mktemp -d)
+archive=hubproxy-$version-linux-amd64.tar.gz
+docker image save "hubproxy:$version" | gzip -1 > "$out/$archive"
+(cd "$out" && sha256sum "$archive" > "$archive.sha256")
+
+target=deploy@host.example.com
+ssh "$target" 'mkdir -p /opt/hubproxy'
+scp "$out/$archive" "$out/$archive.sha256" "$target:/opt/hubproxy/"
+scp deploy/compose.yaml "$target:/opt/hubproxy/compose.yaml.candidate"
+printf 'version=%s\n' "$version"
+```
+
+The last line prints the version used for both the image tag and the `/ready` response. Keep the images, archives, and checksums for the current and previous successful release so you can roll back.
+
+## Prepare the deployment host
+
+Run these commands on the host. The production template, `deploy/compose.yaml`, uses a locally loaded image and configures a health check and log rotation. The service listens on `127.0.0.1:15001` on the host. For an existing deployment, back up its Compose file and mounted configuration, then reconcile them with `compose.yaml.candidate`. Preserve the project name, service name, mounts and runtime settings. Before the first upgrade, set `HUBPROXY_IMAGE` in `release.env` to the full reference of the running image and record the version reported by `/ready`. If the image uses a mutable tag such as `latest`, give the running image ID a dedicated rollback tag and record that tag.
+
+```bash
+cd /opt/hubproxy
+umask 077
+test -e compose.yaml || install -m 600 compose.yaml.candidate compose.yaml
+touch runtime.env
+chmod 600 runtime.env
+```
+
+Set `HUBPROXY_DOWNLOAD_USERNAME` and `HUBPROXY_DOWNLOAD_PASSWORD` in `runtime.env` for authenticated large downloads. The file can be empty if you do not use download login. For an existing dedicated credentials file, point the Compose `env_file` to that file. To keep custom settings, enable the template’s read-only mount at `/app/config.toml` and retain the host configuration file. `release.env` holds only the image reference. Keep these runtime settings across upgrades.
+
+Configure Caddy or Nginx on the host to forward the public HTTPS domain to `127.0.0.1:15001` and set the client IP headers. [Reverse proxy configuration](/en/deployment/reverse-proxy/)
+
+## Deploy and verify
+
+On the host, replace the example `version` with the build output. The commands verify the archive and image metadata before switching. They save the previous image selection when it changes and retain that backup if you retry the same release.
+
+```bash
+set -euo pipefail
+cd /opt/hubproxy
+version=git-0123456789ab
+unset HUBPROXY_IMAGE
+archive=hubproxy-$version-linux-amd64.tar.gz
+sha256sum --check "$archive.sha256"
+docker image load -i "$archive"
+test "$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "hubproxy:$version")" = linux/amd64
+revision=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "hubproxy:$version")
+test "git-${revision:0:12}" = "$version"
+
+printf 'HUBPROXY_IMAGE=hubproxy:%s\n' "$version" > release.next.env
+docker compose --env-file release.next.env config --quiet
+test "$(docker compose --env-file release.next.env config --images hubproxy)" = "hubproxy:$version"
+if [ -f release.env ] && ! cmp -s release.env release.next.env; then
+  cp -p release.env release.previous.env
+fi
+mv release.next.env release.env
+docker compose --env-file release.env up -d --wait --wait-timeout 90 hubproxy
+```
+
+Set `public` to your public service URL. From the host, use `curl` and `jq` to verify readiness and the exact version through both loopback and public HTTPS. Fetch the Ubuntu signed index through the public mirror route and check its header. If you use a custom allowlist, substitute a repository file that it allows and check the expected content.
+
+```bash
+public=https://proxy.example.com
+for base in http://127.0.0.1:15001 "$public"; do
+  curl -fsS --max-time 15 "$base/ready" |
+    jq -e --arg v "$version" '.ready == true and .version == $v'
+done
+curl -fsS --max-time 60 "$public/mirrors/archive.ubuntu.com/ubuntu/dists/noble/InRelease" |
+  grep -F -- '-----BEGIN PGP SIGNED MESSAGE-----'
+```
+
+## Roll back
+
+If an upgrade or smoke test fails, recreate the service with the previous image. The commands below use `release.previous.env` from a prior release. Compare the version in `/ready` with the value recorded before the upgrade and test a download path supported by the old version. If you also changed the host configuration, restore the matching backup first.
+
+```bash
+cd /opt/hubproxy
+cp -p release.previous.env release.rollback.env
+unset HUBPROXY_IMAGE
+mv release.rollback.env release.env
+docker compose --env-file release.env up -d --wait --wait-timeout 90 hubproxy
+curl -fsS http://127.0.0.1:15001/ready | jq '{ready,version}'
+```

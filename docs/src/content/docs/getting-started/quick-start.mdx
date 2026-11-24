@@ -1,63 +1,36 @@
 ﻿---
 title: 快速开始
-description: 使用 Docker 或安装脚本在数分钟内运行 HubProxy。
+description: 使用 Git 和 Docker Compose 从 ywyz/hubproxy 的 main 分支构建并验证本地服务。
 ---
 
-HubProxy 提供 Docker 镜像与系统安装包两种主流部署方式。
+## 从源码启动
 
-## Docker 部署（推荐）
-
-在当前分支的仓库根目录运行以下命令。
+准备好 Git、Docker 和 Docker Compose，在准备存放源码的目录中运行以下命令。
 
 ```bash
-docker build -t hubproxy:local .
-docker run -d \
-  --name hubproxy \
-  -p 5000:5000 \
-  --restart always \
-  -v "$PWD/src/config.toml:/app/config.toml:ro" \
-  hubproxy:local
+git clone --branch main https://github.com/ywyz/hubproxy.git
+cd hubproxy
+docker compose up -d --build
 ```
 
-:::tip
-使用 [Docker Compose](/deployment/docker/) 可更方便地挂载配置文件；日志轮转已在 Compose 文件中预置。
-:::
-
-## 安装上游系统发行包
-
-以下脚本根据系统与架构从 `sky22333/hubproxy` 的 GitHub Releases 下载 `.deb`、`.rpm` 或 `.apk`。要使用本分支的软件包镜像和大文件登录功能，请按上面的步骤构建 Docker 镜像。
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/sky22333/hubproxy/main/install.sh | sh
-```
-
-安装完成后服务会自动启动，配置文件位于 `/etc/hubproxy/config.toml`。
+仓库自带的 Compose 文件会构建 `hubproxy:local` 镜像，将主机的 `5000` 端口映射到容器，并以只读方式挂载 `src/config.toml`。默认配置已启用网页界面和常用 Linux 软件源。
 
 ## 验证服务
 
 ```bash
-curl http://127.0.0.1:5000/ready   # 本地健康检查
+curl -fsS http://127.0.0.1:5000/ready
 ```
 
-正常响应示例：
+服务就绪后返回 HTTP 200，JSON 中包含 `"ready":true` 和 `"service":"hubproxy"`。此时可用浏览器打开 [本地首页](http://127.0.0.1:5000/)。还可以通过默认允许的 Debian 软件源验证一次上游请求。
 
-```json
-{
-  "ready": true,
-  "service": "hubproxy",
-  "version": "v1.x.x",
-  "start_time_unix": 1710000000,
-  "uptime_sec": 42.5,
-  "uptime_human": "42秒"
-}
+```bash
+curl -fsSI http://127.0.0.1:5000/mirrors/deb.debian.org/debian/dists/stable/InRelease
 ```
 
-## 下一步
+正常会返回 HTTP 200。若请求失败，可在仓库目录运行 `docker compose logs --tail=50 hubproxy` 查看日志。
 
-- [系统安装与服务管理](/getting-started/install/)
-- [Docker Compose 部署](/deployment/docker/)
-- [Docker 镜像加速用法](/guides/docker-mirror/)
+## 调整部署
 
-## 生产环境建议
-
-验证通过后，建议尽快为 HubProxy 配置**自有域名 + 反向代理 + HTTPS**（如 Caddy / Nginx），客户端通过 `https://example.com` 访问，而不是长期使用裸 `http://IP:5000`。详见 [推荐部署架构](/deployment/architecture/) 与 [反向代理配置](/deployment/reverse-proxy/)。
+- **大文件下载。** 默认匿名单文件上限为 2 GiB。需要下载更大的文件时，配置 `HUBPROXY_DOWNLOAD_USERNAME` 和 `HUBPROXY_DOWNLOAD_PASSWORD`，再运行 `docker compose up -d` 使容器读取新值。浏览器用户可通过 `/login` 登录。[传输特性](../../guides/capabilities/) · [配置参考](../../configuration/reference/)
+- **HTTPS 与镜像源。** 对外提供服务时可使用 Caddy 或 Nginx 终止 TLS。可在 `src/config.toml` 中调整允许使用的软件源。[Docker 部署](../../deployment/docker/) · [反向代理](../../deployment/reverse-proxy/) · [软件包镜像](../../guides/package-mirrors/)
+- **上游系统包。** 安装脚本默认下载 `sky22333/hubproxy` 发布的 `.deb`、`.rpm` 或 `.apk`。使用上述源码构建即可部署本 fork 的功能。[系统安装说明](../install/)

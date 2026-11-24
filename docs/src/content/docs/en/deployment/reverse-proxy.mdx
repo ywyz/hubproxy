@@ -5,6 +5,8 @@ description: Configure Caddy and Nginx to pass the real client IP correctly.
 
 The reverse proxy must **overwrite** the real client IP so HubProxy can rate-limit per user and resist IP spoofing.
 
+The examples use the root Compose file's host port, `5000`. If you use `deploy/compose.yaml`, point the reverse proxy at `127.0.0.1:15001`. [Production deployment](/en/deployment/docker/)
+
 ## Caddy
 
 ### Basic

@@ -29,3 +29,7 @@ docs/.astro/
 
 # Logs
 *.log
+
+# Local Compose credentials
+/.env
+/deploy/runtime.env

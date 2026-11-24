@@ -1,9 +1,24 @@
 ---
 title: 传输特性
-description: HubProxy 在 Docker 拉取与 GitHub 下载场景下的能力边界说明。
+description: 对比 HubProxy 原版和本分支的下载行为，说明直链、软件包镜像、大文件登录及迁移配置。
 ---
 
-本文基于当前代码实现（`src/handlers/docker.go`、`src/handlers/github.go`），说明各场景的传输行为。
+## 原版与本分支的区别
+
+两个版本都支持 Docker Registry 镜像拉取与搜索、离线镜像 tar、GitHub Release、Raw、Git 操作和 Hugging Face 下载。下表比较[原版 sky22333/hubproxy 的 `77ece22`](https://github.com/sky22333/hubproxy/tree/77ece220eed26a2be12b03cf5f46173156ac55fb) 和[本分支 ywyz/hubproxy 的 `687d926`](https://github.com/ywyz/hubproxy/tree/687d92634a3089cf77e497f002ed5c2b7aceed34)。
+
+| 场景 | 原版 | 本分支 |
+| --- | --- | --- |
+| 第三方软件下载 | 文件代理识别预设的 GitHub 和 Hugging Face URL 格式。 | 可代理白名单内其他公开 HTTPS 文件。例如，上游发布的 `https://downloads.example.org/releases/v1.2.3/app.zip` 可通过 `/https://downloads.example.org/releases/v1.2.3/app.zip` 下载。支持 GET、HEAD 和单区间 Range。 |
+| Linux 软件包仓库 | 没有专用的软件包镜像入口。 | 包管理器可将仓库基址改为 `/mirrors/<上游主机>/<仓库路径>`。镜像内置白名单列出了 Ubuntu、Debian、Omarchy stable、Arch、Alpine、Rocky 的选定目录。仓库文件按原始字节返回，签名仍由包管理器验证。 |
+| 下载限额 | GitHub 和 Hugging Face 响应声明的长度超过 `[server].fileSize` 时返回 413。 | 该值成为匿名下载上限，默认及最高均为 2 GiB，适用于文件、单个 Registry blob 和单次离线 tar。超过上限返回 401，使用本地下载账号登录后不限大小。文件分段按完整文件大小判断。 |
+| 跨站重定向与出站代理 | 文件下载使用共享 HTTP 客户端。 | 跨源仓库重定向会移除来源凭据。通用直链和镜像会逐跳检查访问规则。对固定目标 IP 的请求，HubProxy 按原域名选择代理。使用 HTTPS 代理时，先验证代理证书，再在 CONNECT 隧道内按下载域名验证目标证书。 |
+
+### 从原版迁移
+
+1. 使用本分支的代码或镜像。仓库的 Compose 文件会构建 `hubproxy:local`，并将宿主机的 `./src/config.toml` 挂载到容器的 `/app/config.toml`。已有挂载会覆盖镜像随附的配置。
+2. 保留仓库及镜像用的 `[access].whiteList` 和 `blackList`。在同一节把要开放的直链、软件包目录及所需 CDN 重定向目标加入 `directLinkWhiteList`，可用 `directLinkBlackList` 排除子路径。旧配置省略直链白名单或设为 `[]` 时，通用直链和软件包镜像都会返回 403。[软件源清单和配置示例](/guides/package-mirrors/)
+3. 需要超过匿名上限的下载时，配置 `[downloadAuth].username` 和 `password`，或设置 `HUBPROXY_DOWNLOAD_USERNAME` 和 `HUBPROXY_DOWNLOAD_PASSWORD`，然后重启服务。浏览器通过 HTTPS 打开 `/login`，命令行或 IDM 可对 HubProxy 使用 HTTP Basic 认证。此账号仅用于本地下载，仓库访问规则仍然生效。[下载客户端配置](/guides/github-proxy/)
 
 ## Docker 镜像拉取
 
@@ -16,7 +31,7 @@ HubProxy 通过 go-containerregistry 向上游拉取 manifest 与 blob，再以 
 | 多 Registry 路径 | ✅ | 如 `example.com/ghcr.io/owner/image:tag` |
 | containerd `ns` 参数 | ✅ | 识别 `[registries]` 中的 registry |
 | 认证 realm 改写 | ✅ | 上游 token 地址改写到 HubProxy `/token` |
-| HTTP Range / layer 内续传 | ❌ | blob 始终整层读取后转发，不读取客户端 `Range` |
+| HTTP Range / layer 内续传 | ❌ | 每次 GET 返回整层，客户端中断后需重新请求该层 |
 | layer 级重试 | ✅ | Docker/containerd 拉取失败会重试整个 layer |
 
 :::note
@@ -25,7 +40,7 @@ HubProxy 通过 go-containerregistry 向上游拉取 manifest 与 blob，再以 
 
 ### 与标准 Registry 的差异
 
-- blob 非透明透传，由 HubProxy 从上游完整拉取后再 `io.Copy` 转发
+- 已知长度的 blob 可流式转发。匿名下载遇到未知长度时，先暂存到临时文件并检查大小。
 - 不支持 PATCH/PUT 上传（仅拉取）
 - HEAD / GET manifest 支持
 
@@ -55,7 +70,7 @@ wget -c "https://example.com/https://github.com/owner/repo/releases/download/v1.
 
 | 能力 | 支持 |
 |------|------|
-| 流式打包 tar | ✅ |
+| 流式打包 tar | 登录后边生成边下载。匿名请求先暂存完整归档并检查大小 |
 | 一次性 token（2 分钟） | ✅ |
 | Range / 断点续传 | ❌ |
 | `Cache-Control: no-store` | ✅ |

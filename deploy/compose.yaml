@@ -1,0 +1,22 @@
+services:
+  hubproxy:
+    image: ${HUBPROXY_IMAGE:?Set HUBPROXY_IMAGE in release.env}
+    pull_policy: never
+    restart: unless-stopped
+    env_file: ./runtime.env
+    ports:
+      - "127.0.0.1:15001:5000"
+    # To use an existing configuration, place it next to this file and enable the mount.
+    # volumes:
+    #   - ./config.toml:/app/config.toml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5000/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "200m"
+        max-file: "3"
