@@ -49,7 +49,7 @@ Pulling one Docker image triggers multiple layer requests — each HTTP request 
 |-----|-------------|
 | `whiteList` | Allowed repos/images (empty = no restriction; does not authorize direct links) |
 | `blackList` | Blocked repos/images (does not apply to direct links) |
-| `directLinkWhiteList` | Allowed arbitrary HTTPS direct links (missing or empty = deny all) |
+| `directLinkWhiteList` | Allowed HTTPS direct links and package repository paths. The bundled configuration includes [selected official Linux package repositories](../../guides/package-mirrors/). A missing or empty list denies all. |
 | `directLinkBlackList` | Blocked arbitrary HTTPS direct links |
 | `proxy` | Upstream SOCKS5 proxy, e.g. `socks5://127.0.0.1:1080` or `socks5://user:pass@host:1080` |
 

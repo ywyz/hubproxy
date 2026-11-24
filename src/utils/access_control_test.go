@@ -172,6 +172,46 @@ directLinkWhiteList = []
 	}
 }
 
+func TestBundledPackageMirrorAllowlist(t *testing.T) {
+	t.Setenv("CONFIG_PATH", filepath.Join("..", "config.toml"))
+	if err := config.LoadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		host, path string
+		allowed    bool
+	}{
+		{"archive.ubuntu.com", "ubuntu/dists/noble/InRelease", true},
+		{"security.ubuntu.com", "ubuntu/dists/noble-security/InRelease", true},
+		{"ports.ubuntu.com", "ubuntu-ports/dists/noble/main/binary-arm64/Packages.xz", true},
+		{"deb.debian.org", "debian/dists/stable/InRelease", true},
+		{"deb.debian.org", "debian-security/dists/stable-security/InRelease", true},
+		{"security.debian.org", "debian-security/dists/stable-security/InRelease", true},
+		{"cdn-fastly.deb.debian.org", "debian/pool/main/a/apt/apt.deb", true},
+		{"pkgs.omarchy.org", "stable/x86_64/omarchy.db", true},
+		{"stable-mirror.omarchy.org", "core/os/x86_64/core.db", true},
+		{"geo.mirror.pkgbuild.com", "extra/os/x86_64/extra.db", true},
+		{"dl-cdn.alpinelinux.org", "alpine/v3.24/main/x86_64/APKINDEX.tar.gz", true},
+		{"dl-cdn.alpinelinux.org", "alpine/latest-stable/community/aarch64/APKINDEX.tar.gz", true},
+		{"dl.rockylinux.org", "pub/rocky/9/BaseOS/x86_64/os/repodata/repomd.xml", true},
+		{"dl.rockylinux.org", "pub/rocky/10/AppStream/aarch64/os/repodata/repomd.xml", true},
+		{"other.example.org", "debian/dists/stable/InRelease", false},
+		{"archive.ubuntu.com", "outside/ubuntu/dists/noble/InRelease", false},
+		{"deb.debian.org", "debian-cd/README", false},
+		{"pkgs.omarchy.org", "edge/x86_64/omarchy.db", false},
+		{"geo.mirror.pkgbuild.com", "core-testing/os/x86_64/core-testing.db", false},
+		{"dl-cdn.alpinelinux.org", "alpine/v3.24/releases/x86_64/file.iso", false},
+		{"dl.rockylinux.org", "pub/rocky/10/isos/x86_64/file.iso", false},
+	} {
+		t.Run(tc.host+"/"+tc.path, func(t *testing.T) {
+			allowed, reason := GlobalAccessController.CheckDirectLinkAccess([]string{tc.host, tc.path})
+			if allowed != tc.allowed {
+				t.Errorf("allowed = %t, want %t (%s)", allowed, tc.allowed, reason)
+			}
+		})
+	}
+}
+
 func TestDirectLinkAccessRequiresExplicitGlobalWildcard(t *testing.T) {
 	t.Run("host wildcard alone is denied", func(t *testing.T) {
 		loadAccessConfig(t, `

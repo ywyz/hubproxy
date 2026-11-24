@@ -1,9 +1,26 @@
 ---
-title: Omarchy 与其他软件包镜像源
-description: 通过 HubProxy 为 pacman 等包管理器按需转发软件包、仓库索引和签名。
+title: Linux 软件包镜像源
+description: 使用镜像自带的 Ubuntu、Debian、Omarchy、Arch、Alpine 和 Rocky Linux 软件包源，或添加其他 HTTPS 仓库。
 ---
 
 软件包管理器可以把 `https://proxy.example.org/mirrors/<上游主机>/<仓库路径>` 用作仓库地址。HubProxy 按请求拉取数据库、包文件和签名，安装包仍由本机包管理器校验。加速效果取决于客户端到 HubProxy、HubProxy 到上游的两段网络。
+
+## Docker 镜像预置的仓库
+
+镜像内的 `/app/config.toml` 和仓库中的 `src/config.toml` 预置下表目录。将软件源基址开头的 `http://` 或 `https://` 换成 `https://proxy.example.org/mirrors/`，保留原来的仓库、发行版本、组件、架构和签名设置。HubProxy 通过 HTTPS 连接上游。
+
+| 发行版 | 可使用的上游主机和路径 | 官方资料 |
+| --- | --- | --- |
+| Ubuntu | `archive.ubuntu.com/ubuntu/`（主仓库）、`security.ubuntu.com/ubuntu/`（安全更新）、`ports.ubuntu.com/ubuntu-ports/`（含 arm64） | [Ubuntu 软件包管理](https://ubuntu.com/server/docs/how-to/software/package-management/) · [Ubuntu Ports](https://ports.ubuntu.com/ubuntu-ports/) |
+| Debian | `deb.debian.org/debian/`（主仓库）、`deb.debian.org/debian-security/` 或 `security.debian.org/debian-security/`（安全更新）。`cdn-fastly.deb.debian.org` 也允许这两个仓库目录 | [Debian 官方 CDN 端点](https://deb.debian.org/) |
+| Omarchy stable | `pkgs.omarchy.org/stable/x86_64/`，以及 `stable-mirror.omarchy.org` 上的 `core`、`extra`、`multilib` 仓库（x86_64） | [Omarchy stable mirrorlist](https://github.com/omacom/omarchy/blob/quattro/default/pacman/mirrorlist-stable) |
+| Arch Linux | `geo.mirror.pkgbuild.com/$repo/os/$arch`，适用于 x86_64 的 `core`、`extra`、`multilib` | [Arch 官方镜像记录](https://archlinux.org/mirrors/geo.mirror.pkgbuild.com/) |
+| Alpine | `dl-cdn.alpinelinux.org/alpine/` 下的 `v3.22`、`v3.23`、`v3.24` 和 `latest-stable`，各含 `main`、`community` | [Alpine 发行分支](https://alpinelinux.org/releases/) |
+| Rocky Linux | `dl.rockylinux.org/pub/rocky/` 下的 `9`、`10`，各含 `BaseOS`、`AppStream`、`extras` | [Rocky 官方仓库](https://dl.rockylinux.org/pub/rocky/) |
+
+例如，Ubuntu 的 deb822 软件源可将主仓库的 `URIs` 改为 `https://proxy.example.org/mirrors/archive.ubuntu.com/ubuntu`。Alpine 的 `/etc/apk/repositories` 可使用 `https://proxy.example.org/mirrors/dl-cdn.alpinelinux.org/alpine/v3.24/main`。Rocky 的 BaseOS 仓库可将对应的 `mirrorlist` 行替换为 `baseurl=https://proxy.example.org/mirrors/dl.rockylinux.org/pub/rocky/$releasever/BaseOS/$basearch/os/`。
+
+自行挂载到 `/app/config.toml` 的文件会覆盖镜像配置。升级已有部署时，将所需规则合并到自己的 `[access].directLinkWhiteList` 并重启容器。此名单同时控制 `/mirrors/` 和通用 HTTPS 直链，省略或清空名单会使两个入口返回 403。
 
 ## Omarchy stable（x86_64）
 
@@ -11,7 +28,7 @@ Omarchy 自己发布的软件包来自 `pkgs.omarchy.org`，Arch 的 `core`、`e
 
 ### 配置 HubProxy
 
-在已有 `config.toml` 的 `[access].directLinkWhiteList` 中加入所需目录，重启 HubProxy 后生效。以下为一台仅代理 Omarchy stable 软件包的示例。
+镜像的预置配置已包含这四个目录。若自定义部署只需 Omarchy stable，可使用以下名单。
 
 ```toml
 [access]

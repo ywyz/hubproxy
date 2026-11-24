@@ -26,7 +26,7 @@ curl -L -O "https://example.com/https://ollama.com/download/OllamaSetup.exe"
 ```
 
 :::note
-Arbitrary HTTPS direct links are opt-in. Add each required host or path to `[access].directLinkWhiteList` first; a missing or empty list makes every arbitrary direct link return 403. GitHub, Hugging Face, and Docker repositories continue to use the existing `whiteList` / `blackList`.
+HTTPS direct links require a matching entry in `[access].directLinkWhiteList`. The Docker image and repository configuration include selected Linux package repositories. Add each additional upstream you need. A missing or empty list makes all arbitrary direct links return 403. GitHub, Hugging Face and Docker repositories use the separate `whiteList` / `blackList`. [Bundled package mirrors](../package-mirrors/)
 :::
 
 ### Global Git acceleration

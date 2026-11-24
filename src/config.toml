@@ -43,9 +43,44 @@ blackList = [
     "baduser/*"
 ]
 
-# 通用 HTTPS 直链白名单（独立于仓库/镜像名单）
-# 缺失或为空时拒绝所有通用直链；仅 "*/*" 显式允许任意域名和路径
-directLinkWhiteList = []
+# 镜像源和通用 HTTPS 直链共用此白名单。清空数组即可关闭这两种入口。
+directLinkWhiteList = [
+    # Ubuntu APT：主仓库、安全更新、其他架构
+    "archive.ubuntu.com/ubuntu/*",
+    "security.ubuntu.com/ubuntu/*",
+    "ports.ubuntu.com/ubuntu-ports/*",
+    # Debian APT：主仓库、安全更新与官方列出的 Fastly 端点
+    "deb.debian.org/debian/*",
+    "deb.debian.org/debian-security/*",
+    "security.debian.org/debian-security/*",
+    "cdn-fastly.deb.debian.org/debian/*",
+    "cdn-fastly.deb.debian.org/debian-security/*",
+    # Omarchy stable（x86_64）
+    "pkgs.omarchy.org/stable/x86_64/*",
+    "stable-mirror.omarchy.org/core/os/x86_64/*",
+    "stable-mirror.omarchy.org/extra/os/x86_64/*",
+    "stable-mirror.omarchy.org/multilib/os/x86_64/*",
+    # Arch Linux（x86_64）
+    "geo.mirror.pkgbuild.com/core/os/x86_64/*",
+    "geo.mirror.pkgbuild.com/extra/os/x86_64/*",
+    "geo.mirror.pkgbuild.com/multilib/os/x86_64/*",
+    # Alpine：仅开放指定稳定版本的软件包目录
+    "dl-cdn.alpinelinux.org/alpine/v3.22/main/*",
+    "dl-cdn.alpinelinux.org/alpine/v3.22/community/*",
+    "dl-cdn.alpinelinux.org/alpine/v3.23/main/*",
+    "dl-cdn.alpinelinux.org/alpine/v3.23/community/*",
+    "dl-cdn.alpinelinux.org/alpine/v3.24/main/*",
+    "dl-cdn.alpinelinux.org/alpine/v3.24/community/*",
+    "dl-cdn.alpinelinux.org/alpine/latest-stable/main/*",
+    "dl-cdn.alpinelinux.org/alpine/latest-stable/community/*",
+    # Rocky Linux：主版本目录可随小版本更新继续使用
+    "dl.rockylinux.org/pub/rocky/9/BaseOS/*",
+    "dl.rockylinux.org/pub/rocky/9/AppStream/*",
+    "dl.rockylinux.org/pub/rocky/9/extras/*",
+    "dl.rockylinux.org/pub/rocky/10/BaseOS/*",
+    "dl.rockylinux.org/pub/rocky/10/AppStream/*",
+    "dl.rockylinux.org/pub/rocky/10/extras/*",
+]
 
 # 通用 HTTPS 直链黑名单；仅在白名单允许后用于排除具体域名或路径
 directLinkBlackList = []

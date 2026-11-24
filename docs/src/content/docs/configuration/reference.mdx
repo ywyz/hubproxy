@@ -49,7 +49,7 @@ Docker 拉取一个镜像会请求多个 layer，每个 HTTP 请求均消耗限�
 |----|------|
 | `whiteList` | 允许代理的仓库/镜像（空=不限制；不授权通用直链） |
 | `blackList` | 禁止代理的仓库/镜像（不作用于通用直链） |
-| `directLinkWhiteList` | 允许代理的通用 HTTPS 直链（缺失或空=拒绝全部） |
+| `directLinkWhiteList` | 允许代理的通用 HTTPS 直链和软件源目录。随附配置包含[部分 Linux 官方软件源](../../guides/package-mirrors/)，省略或清空名单会拒绝全部。 |
 | `directLinkBlackList` | 禁止代理的通用 HTTPS 直链 |
 | `proxy` | 上游 SOCKS5 代理，如 `socks5://127.0.0.1:1080` 或 `socks5://user:pass@host:1080` |
 

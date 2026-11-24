@@ -30,12 +30,15 @@
 
 ### Docker 部署（推荐）
 
+在当前分支的仓库根目录构建并启动：
+
 ```bash
+docker build -t hubproxy:local .
 docker run -d \
   --name hubproxy \
   -p 5000:5000 \
   --restart always \
-  ghcr.io/sky22333/hubproxy
+  hubproxy:local
 ```
 
 验证服务：
@@ -46,9 +49,9 @@ curl http://127.0.0.1:5000/ready
 
 或者网页访问
 
-### 脚本安装
+### 安装上游系统发行包
 
-自动识别 `amd64` / `arm64` 与 `apt`、`dnf`、`apk` 等包管理器：
+以下脚本安装 `sky22333/hubproxy` 的发行包。要部署本分支的软件包镜像和大文件登录功能，请使用上面的 Docker 构建命令。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sky22333/hubproxy/main/install.sh | sh
@@ -72,13 +75,13 @@ git clone https://yourdomain.com/https://github.com/sky22333/hubproxy.git
 
 > **生产环境建议**：绑定自有域名，通过 Caddy / Nginx 反代并开启 HTTPS，不要长期暴露裸 `http://IP:5000`。详见 [文档](https://docs.52013120.xyz/getting-started/quick-start/)。
 
-> **直链默认关闭**：任意 HTTPS 直链必须通过 `[access].directLinkWhiteList` 显式启用；缺失或空数组都会拒绝直链，只有 `"*/*"` 才会全量放行。
+> Docker 镜像和仓库随附的 `config.toml` 只放行指定 Linux 软件源目录。其他 HTTPS 直链需要加入 `[access].directLinkWhiteList`，省略该项或设为空数组会拒绝全部通用直链。
 
 ### 大文件与软件包镜像
 
 默认单文件不超过 2 GiB 可匿名下载。要开放更大的文件，请在服务环境设置 `HUBPROXY_DOWNLOAD_USERNAME` 和 `HUBPROXY_DOWNLOAD_PASSWORD` 并重启。浏览器在 `/login` 登录，IDM 可在“选项 → 站点登录”中保存 HubProxy 的 HTTPS 地址及账号。服务端按完整文件大小鉴权，登录后不设大小上限。使用方法见[大文件与 IDM 指南](docs/src/content/docs/guides/github-proxy.mdx)。
 
-Omarchy 和其他 HTTPS 软件包源使用 `/mirrors/<上游主机>/<原路径>`。管理员先将上游加入直链白名单，用户再替换包管理器中的源地址。完整的 pacman 配置见[软件包镜像指南](docs/src/content/docs/guides/package-mirrors.mdx)。
+使用 `/mirrors/<上游主机>/<原路径>` 可代理 Ubuntu、Debian、Omarchy stable、Arch Linux、Alpine 和 Rocky Linux 的预置软件源。例如，Ubuntu 主仓库可使用 `https://你的域名/mirrors/archive.ubuntu.com/ubuntu`。自定义挂载的 `config.toml` 会覆盖镜像配置，已有部署可将所需目录合并到直链白名单。[内置仓库清单和包管理器配置](docs/src/content/docs/guides/package-mirrors.mdx)
 
 ## 详细文档
 
